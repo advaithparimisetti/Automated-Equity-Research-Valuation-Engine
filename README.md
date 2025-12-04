@@ -1,9 +1,10 @@
 # 📈 Automated Equity Research & Valuation Engine
-
+https://automated-equity-research-valuation-engine.streamlit.app/
 ![Python](https://img.shields.io/badge/Python-3.9%2B-blue)
 ![Streamlit](https://img.shields.io/badge/Streamlit-1.28%2B-FF4B4B)
 ![Finance](https://img.shields.io/badge/Domain-Fintech-green)
 
+🚀 **Live Demo:** [Click here to use the Engine](https://automated-equity-research-valuation-engine.streamlit.app/)
 A professional-grade equity research dashboard that converts complex financial data into a clean, **1-page visual report**. 
 
 Built for investors and analysts, this engine automates the "grunt work" of fundamental analysis. It fetches real-time data, applies heuristic valuation models, and renders high-resolution infographics suitable for investment memos or quick decision-making.
