@@ -11,6 +11,8 @@ import matplotlib.patches as patches
 from matplotlib.gridspec import GridSpec
 import seaborn as sns
 import io
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
 # Optional PDF export support
 try:
@@ -124,7 +126,8 @@ def fetch_info_with_variants(base_ticker, country_code):
         try:
             t = yf.Ticker(variant)
             info = t.info
-            if info and (info.get("regularMarketPrice") is not None or info.get("symbol")):
+            # Basic check to see if we got valid data
+            if info and (info.get("regularMarketPrice") is not None or info.get("symbol") or info.get("shortName")):
                 return t, info, variant
         except Exception:
             tried.append(variant)
@@ -146,6 +149,46 @@ def fetch_screener_in(ticker_base):
                 facts[label] = value
         return facts
     except: return {}
+
+# --- FALLBACK NEWS FETCHING (GOOGLE RSS) ---
+def fetch_news_fallback(ticker):
+    """
+    Fetches news from Google News RSS if yfinance fails.
+    """
+    news_items = []
+    try:
+        # Create a search query for the ticker
+        query = f"{ticker} stock news"
+        url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+        
+        r = requests.get(url, timeout=4)
+        soup = BeautifulSoup(r.content, features="xml")
+        items = soup.findAll('item')
+        
+        for item in items[:5]: # Top 5 only
+            try:
+                title = item.title.text
+                link = item.link.text
+                pub_date = item.pubDate.text
+                # Convert pubDate to simple string if possible, else keep original
+                try:
+                    dt = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %Z")
+                    date_str = dt.strftime("%Y-%m-%d")
+                except:
+                    date_str = "Recent"
+                
+                news_items.append({
+                    'title': title,
+                    'link': link,
+                    'publisher': 'Google News',
+                    'providerPublishTime': date_str 
+                })
+            except:
+                continue
+    except Exception:
+        pass
+    
+    return news_items
 
 # --- SCORING LOGIC ---
 def score_undervalued_from_info(info):
@@ -234,6 +277,7 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
     summary = {
         "ticker_requested": ticker_input,
         "ticker_used": used_variant,
+        "yf_object": yf_obj,
         "company": info.get("shortName") or info.get("longName") or used_variant,
         "price": safe_numeric(info.get("regularMarketPrice")),
         "price_currency": info.get("currency"),
@@ -251,7 +295,16 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
     }
     return summary
 
-# --- PLOTTING UTILS ---
+# --- CHARTING HELPER: RSI CALCULATION ---
+def calculate_rsi(data, window=14):
+    delta = data.diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi
+
+# --- PLOTTING UTILS (STATIC INFOGRAPHIC) ---
 def draw_kpi(ax, title, value, subtitle=None, fontsize=12, small=False):
     ax.axis('off')
     ax.add_patch(patches.Rectangle((0, 0), 1, 1, color='white', ec='#e6e6e6', lw=1, zorder=0))
@@ -272,37 +325,19 @@ def gauge_bar(ax, pct, label, bgcolor='#f3f3f3'):
 
 def radar_plot(ax, labels, values, title=None):
     N = len(labels)
-    # Compute angle for each axis
     angles = [n / float(N) * 2 * np.pi for n in range(N)]
-    
-    # We need to close the loop for the plot data
-    angles_plot = angles + angles[:1]
-    vals_plot = values + values[:1]
-
+    angles += angles[:1]
+    vals = values + values[:1]
     ax.set_theta_offset(np.pi / 2)
     ax.set_theta_direction(-1)
-
-    # 1. Set the ticks at the calculated angles
-    ax.set_xticks(angles)
-    
-    # 2. Set the labels (Strengths) instead of degrees
-    # Added padding so text doesn't overlap the web
+    ax.set_xticks(angles[:-1])
     ax.set_xticklabels(labels, size=11, color='#333', fontweight='bold')
-
-    # 3. Clean up radial labels (y-axis)
-    # Hide the 0.2, 0.4, etc. numbers to focus on the shape/strength aspect
     ax.set_yticks([0.25, 0.5, 0.75])
-    ax.set_yticklabels([]) # Hides the text labels
-    
-    # Ensure range is 0 to 1
+    ax.set_yticklabels([])
     ax.set_ylim(0, 1)
-
-    # Plot data
-    ax.plot(angles_plot, vals_plot, linewidth=2, linestyle='solid', color='#2b7fc1')
-    ax.fill(angles_plot, vals_plot, color='#2b7fc1', alpha=0.25)
-
+    ax.plot(angles, vals, linewidth=2, linestyle='solid', color='#2b7fc1')
+    ax.fill(angles, vals, color='#2b7fc1', alpha=0.25)
     if title:
-        # Move title slightly up
         ax.set_title(title, y=1.1, fontsize=12, fontweight='bold', color='#111')
 
 def fmt_pct_val(x):
@@ -355,18 +390,13 @@ def render_infographic(playbook_result):
     ax_checklist_panels = [fig.add_subplot(gs[3+i, 3:6]) for i in range(2)]
     ax_price = fig.add_subplot(gs[5, 0:6])
 
-    # -------------------------------------------------------------
-    # CUSTOMIZATION: Name + Disclaimer in Header
-    # -------------------------------------------------------------
+    # Name + Disclaimer in Header
     ax_header.axis('off')
     ax_header.text(0.01, 0.7, company, fontsize=20, fontweight='bold', color='#111')
     ax_header.text(0.01, 0.48, f"{ticker_used}   |   Sector: {sector}", fontsize=11, color='#444')
     ax_header.text(0.01, 0.28, f"Price: {human_readable_price(price, price_ccy)}    MarketCap: {human_readable_marketcap(mcap, mcap_ccy)}", fontsize=11, color='#333')
     ax_header.text(0.01, 0.08, f"Report generated: {datetime.utcnow().strftime('%Y-%m-%d')} | Analysis by Sai Advaith Parimisetti", fontsize=9, color='#666')
-    
-    # Disclaimer on the image itself
     ax_header.text(0.01, -0.15, "Disclaimer: For informational purposes only. Not financial advice.", fontsize=7, color='#999', ha='left')
-
 
     ax_right.axis('off')
     ax_right.add_patch(patches.Rectangle((0.02, 0.12), 0.96, 0.76, color='#fafafa', ec='#e6e6e6'))
@@ -419,6 +449,7 @@ def render_infographic(playbook_result):
         ax_pos.add_patch(patches.FancyBboxPatch((0.05, y_top-0.12), 0.9, 0.14, boxstyle="round,pad=0.02", color=color, ec=color))
         ax_pos.text(0.07, y_top-0.05, label, va='center', ha='left', color='white', fontsize=10)
 
+    # Static Price History (small one on infographic)
     try:
         hist = yf.Ticker(ticker_used).history(period="12mo")
         if hist is not None and not hist.empty:
@@ -438,19 +469,16 @@ def render_infographic(playbook_result):
     return fig
 
 # ==========================================
-# 2. STREAMLIT APP UI — BEAUTIFIED
+# 2. STREAMLIT APP UI
 # ==========================================
 
-# Update page config with clear title and icon
 st.set_page_config(page_title="Automated Equity Research & Valuation Engine", page_icon="📈", layout="wide", initial_sidebar_state="expanded")
 
-# Custom CSS (typography, spacing, subtle accents)
 custom_css = """
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;700;800&display=swap');
 .stApp{font-family: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial;}
 .stApp { background: linear-gradient(180deg,#071014 0%,#0f1724 100%); }
-/* Dark theme with green accents */
 h1 { color: #9EE6A8; font-weight:800; font-size:44px; margin-bottom:4px; }
 h2, h3 { color:#81C784; font-weight:600; }
 body, p, span { color:#E6F0EA; font-size:15px; line-height:1.6; }
@@ -463,9 +491,7 @@ div.stButton > button:first-child:hover{ transform: translateY(-3px); box-shadow
 .stDownloadButton > button{ background: linear-gradient(90deg,#5FD068 0%,#2D7A3E 100%); border-radius:8px; color:#fff; font-weight:700; }
 .sidebar .css-1d391kg{ padding-top: 1rem; }
 hr{ height:1px; background: linear-gradient(90deg,transparent, rgba(255,255,255,0.06), transparent); border:none; margin:1.5rem 0; }
-/* Hide Streamlit heading anchor link icon that appears on hover */
 .stMarkdown a.anchor-link, .stMarkdown .anchor-link, .anchor-link { display: none !important; }
-/* Also hide 'copy link' icon that may appear next to headings */
 .stMarkdown h1 a, .stMarkdown h2 a, .stMarkdown h3 a { display: none !important; }
 </style>
 """
@@ -496,16 +522,8 @@ with st.sidebar:
     st.markdown('---')
     run_btn = st.button('▶ Generate Research Report', type='primary', use_container_width=True)
     st.markdown('')
-    st.markdown('''
-        <div class="stInfo" style="padding:12px; border-radius:8px;">
-            <strong style="color:#1B4D2B; display:block; margin-bottom:6px;">💡 Quick Tips</strong>
-            <small style="color:#2D7A3E;">• Use exact ticker symbols<br>• Results refresh daily<br>• Download high-res charts</small>
-        </div>
-    ''', unsafe_allow_html=True)
     
-    # -------------------------------------------------------------
-    # CUSTOMIZATION: Added sidebar credits for the website
-    # -------------------------------------------------------------
+    # Credits
     st.markdown("---")
     st.markdown(
         """
@@ -519,39 +537,216 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-# Main
+# --- APP LOGIC WITH SESSION STATE ---
+
+# If the user clicks the run button, fetch new data and save it to session_state
 if run_btn:
     with st.spinner(f"📊 Analyzing {ticker_input}..."):
         summary = run_playbook_for_ticker(ticker_input, country_code)
         if summary:
-            st.markdown('<h3 style="color:#1B4D2B;">Key Metrics</h3>', unsafe_allow_html=True)
-            col1, col2, col3, col4 = st.columns(4, gap='medium')
-            with col1:
-                st.metric('💰 Current Price', human_readable_price(summary['price'], summary['price_currency']))
-            with col2:
-                st.metric('📈 Market Cap', human_readable_marketcap(summary['marketCap'], summary['marketCap_currency']))
-            with col3:
-                underval_pct = min(100, int((summary['undervalued_score'] / 40) * 100))
-                st.metric('🎯 Undervalued', f"{summary['undervalued_score']}/40", f"{underval_pct}%")
-            with col4:
-                multibag_pct = min(100, int((summary['multibagger_score'] / 50) * 100))
-                st.metric('🚀 Multibagger', f"{summary['multibagger_score']}/50", f"{multibag_pct}%")
+            st.session_state['summary'] = summary
+            st.session_state['analysis_done'] = True
+        else:
+            st.session_state['analysis_done'] = False
 
-            st.markdown('')
-            st.markdown('<h3 style="color:#1B4D2B;">Visual Analysis Report</h3>', unsafe_allow_html=True)
-            fig = render_infographic(summary)
-            if fig:
-                st.pyplot(fig, use_container_width=True)
-                fn = f"{ticker_input}_equity_research.png"
-                img = io.BytesIO()
-                fig.savefig(img, format='png', bbox_inches='tight', dpi=150)
-                img.seek(0)
-                st.markdown('<hr>', unsafe_allow_html=True)
-                col_d1, col_d2, col_d3 = st.columns([1,1.5,1])
-                with col_d2:
-                    st.download_button('📥 Download High-Resolution Report', data=img, file_name=fn, mime='image/png', use_container_width=True)
+# Check if we have valid analysis data in the session
+if st.session_state.get('analysis_done', False) and 'summary' in st.session_state:
+    summary = st.session_state['summary']
+
+    # --- Metrics ---
+    st.markdown('<h3 style="color:#1B4D2B;">Key Metrics</h3>', unsafe_allow_html=True)
+    col1, col2, col3, col4 = st.columns(4, gap='medium')
+    with col1:
+        st.metric('💰 Current Price', human_readable_price(summary['price'], summary['price_currency']))
+    with col2:
+        st.metric('📈 Market Cap', human_readable_marketcap(summary['marketCap'], summary['marketCap_currency']))
+    with col3:
+        underval_pct = min(100, int((summary['undervalued_score'] / 40) * 100))
+        st.metric('🎯 Undervalued', f"{summary['undervalued_score']}/40", f"{underval_pct}%")
+    with col4:
+        multibag_pct = min(100, int((summary['multibagger_score'] / 50) * 100))
+        st.metric('🚀 Multibagger', f"{summary['multibagger_score']}/50", f"{multibag_pct}%")
+
+    st.markdown('')
+    
+    # --- TABS ---
+    tab1, tab2, tab3 = st.tabs(["📊 Visual Report", "📈 Interactive Chart", "📋 Fundamental Analysis"])
+    
+    # TAB 1: Infographic
+    with tab1:
+        st.markdown('<h3 style="color:#1B4D2B;">Visual Analysis Report</h3>', unsafe_allow_html=True)
+        fig = render_infographic(summary)
+        if fig:
+            st.pyplot(fig, use_container_width=True)
+            fn = f"{summary['ticker_used']}_equity_research.png"
+            img = io.BytesIO()
+            fig.savefig(img, format='png', bbox_inches='tight', dpi=150)
+            img.seek(0)
+            st.markdown('<hr>', unsafe_allow_html=True)
+            col_d1, col_d2, col_d3 = st.columns([1,1.5,1])
+            with col_d2:
+                st.download_button('📥 Download High-Resolution Report', data=img, file_name=fn, mime='image/png', use_container_width=True)
+
+    # TAB 2: MAX FEATURE CHART
+    with tab2:
+        st.markdown('<h3 style="color:#1B4D2B;">Advanced Technical Chart</h3>', unsafe_allow_html=True)
+        
+        # Chart Controls
+        col_c1, col_c2, col_c3 = st.columns(3)
+        with col_c1:
+            chart_period = st.selectbox("Timeframe", ["1y", "2y", "5y", "10y", "max"], index=1)
+        with col_c2:
+            indicators = st.multiselect("Overlays", ["SMA 50", "SMA 200", "Bollinger Bands"], default=["SMA 50"])
+        with col_c3:
+            oscillator = st.selectbox("Bottom Panel", ["Volume", "RSI"], index=0)
+
+        try:
+            # Fetch History
+            hist = yf.Ticker(summary['ticker_used']).history(period=chart_period)
+            
+            if not hist.empty:
+                # Calculation for Overlays
+                if "SMA 50" in indicators:
+                    hist['SMA50'] = hist['Close'].rolling(window=50).mean()
+                if "SMA 200" in indicators:
+                    hist['SMA200'] = hist['Close'].rolling(window=200).mean()
+                if "Bollinger Bands" in indicators:
+                    hist['MA20'] = hist['Close'].rolling(window=20).mean()
+                    hist['STD20'] = hist['Close'].rolling(window=20).std()
+                    hist['BB_Upper'] = hist['MA20'] + (hist['STD20'] * 2)
+                    hist['BB_Lower'] = hist['MA20'] - (hist['STD20'] * 2)
+
+                # Create Subplots
+                fig_plotly = make_subplots(rows=2, cols=1, shared_xaxes=True, 
+                                            vertical_spacing=0.05, row_heights=[0.7, 0.3],
+                                            subplot_titles=(f"{summary['ticker_used']} Price", oscillator))
+
+                # 1. Price Candle
+                fig_plotly.add_trace(go.Candlestick(x=hist.index,
+                                open=hist['Open'], high=hist['High'],
+                                low=hist['Low'], close=hist['Close'],
+                                name='Price'), row=1, col=1)
+
+                # 2. Add Overlays
+                if "SMA 50" in indicators:
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA50'], 
+                                            line=dict(color='orange', width=1.5), name='SMA 50'), row=1, col=1)
+                if "SMA 200" in indicators:
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA200'], 
+                                            line=dict(color='blue', width=1.5), name='SMA 200'), row=1, col=1)
+                if "Bollinger Bands" in indicators:
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Upper'], 
+                                            line=dict(color='gray', width=1, dash='dot'), name='BB Upper', showlegend=False), row=1, col=1)
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Lower'], 
+                                            line=dict(color='gray', width=1, dash='dot'), fill='tonexty', 
+                                            fillcolor='rgba(128,128,128,0.1)', name='Bollinger Bands'), row=1, col=1)
+
+                # 3. Add Oscillator
+                if oscillator == "Volume":
+                    fig_plotly.add_trace(go.Bar(x=hist.index, y=hist['Volume'], 
+                                        marker_color='teal', name='Volume'), row=2, col=1)
+                elif oscillator == "RSI":
+                    hist['RSI'] = calculate_rsi(hist['Close'])
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], 
+                                            line=dict(color='purple', width=2), name='RSI'), row=2, col=1)
+                    # Add 70/30 Lines
+                    fig_plotly.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
+                    fig_plotly.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+
+                # Layout Tuning
+                fig_plotly.update_layout(
+                    template='plotly_dark',
+                    height=700,
+                    xaxis_rangeslider_visible=False,
+                    margin=dict(l=0, r=0, t=30, b=0)
+                )
+                st.plotly_chart(fig_plotly, use_container_width=True)
+            else:
+                st.warning("No price history available.")
+        except Exception as e:
+            st.error(f"Error creating chart: {e}")
+
+    # TAB 3: Analysis & News
+    with tab3:
+        st.markdown('<h3 style="color:#1B4D2B;">Company Profile & News</h3>', unsafe_allow_html=True)
+        info = summary['fetched_info']
+        
+        col_info_1, col_info_2 = st.columns([2, 1])
+        
+        with col_info_1:
+            st.markdown("#### Business Summary")
+            if 'longBusinessSummary' in info:
+                st.info(info['longBusinessSummary'])
+            else:
+                st.info("No business summary available.")
+                
+        with col_info_2:
+            st.markdown("#### Key Data")
+            stats_df = pd.DataFrame({
+                "Metric": ["Sector", "Industry", "Employees", "Website"],
+                "Value": [
+                    info.get('sector', 'N/A'),
+                    info.get('industry', 'N/A'),
+                    info.get('fullTimeEmployees', 'N/A'),
+                    info.get('website', 'N/A')
+                ]
+            })
+            st.table(stats_df)
+
+        st.markdown("---")
+        st.markdown("#### 📰 Latest News")
+        
+        # --- ROBUST NEWS FETCHING LOGIC ---
+        valid_news_count = 0
+        
+        # 1. Try yfinance first
+        try:
+            yf_news = summary['yf_object'].news
+            if yf_news and isinstance(yf_news, list):
+                for item in yf_news[:5]:
+                    if not isinstance(item, dict): continue
+                    
+                    title = item.get('title')
+                    if not title: continue # Skip if no title
+                    
+                    link = item.get('link', '#')
+                    publisher = item.get('publisher', 'Yahoo Finance')
+                    
+                    # Time formatting
+                    pub_time_raw = item.get('providerPublishTime')
+                    pub_time_str = "Recent"
+                    if pub_time_raw:
+                        try:
+                            pub_time_str = datetime.fromtimestamp(pub_time_raw).strftime('%Y-%m-%d %H:%M')
+                        except: pass
+                    
+                    st.markdown(f"""
+                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px; margin-bottom: 12px; border-left: 4px solid #2D7A3E;">
+                        <a href="{link}" target="_blank" style="color: #AEE7B1; font-weight: 600; text-decoration: none; font-size: 16px; display:block; margin-bottom:4px;">{title}</a>
+                        <div style="color: #9CA3AF; font-size: 12px;">{pub_time_str} • <span style="color:#81C784;">{publisher}</span></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                    valid_news_count += 1
+        except Exception:
+            pass
+        
+        # 2. If yfinance returned 0 valid items, FALLBACK to Google News RSS
+        if valid_news_count == 0:
+            fallback_news = fetch_news_fallback(summary['ticker_used'])
+            if fallback_news:
+                for item in fallback_news:
+                    st.markdown(f"""
+                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px; margin-bottom: 12px; border-left: 4px solid #F59E0B;">
+                        <a href="{item['link']}" target="_blank" style="color: #FCD34D; font-weight: 600; text-decoration: none; font-size: 16px; display:block; margin-bottom:4px;">{item['title']}</a>
+                        <div style="color: #9CA3AF; font-size: 12px;">{item['providerPublishTime']} • <span style="color:#FBBF24;">{item['publisher']}</span></div>
+                    </div>
+                    """, unsafe_allow_html=True)
+                valid_news_count = len(fallback_news)
+            else:
+                st.info("No news found from standard sources.")
+
 else:
-    # Landing
+    # Landing Page
     col_land_1, col_land_2 = st.columns([1.6,1], gap='large')
     with col_land_1:
         st.markdown('''
