@@ -272,18 +272,38 @@ def gauge_bar(ax, pct, label, bgcolor='#f3f3f3'):
 
 def radar_plot(ax, labels, values, title=None):
     N = len(labels)
+    # Compute angle for each axis
     angles = [n / float(N) * 2 * np.pi for n in range(N)]
-    angles += angles[:1]
-    vals = values + values[:1]
+    
+    # We need to close the loop for the plot data
+    angles_plot = angles + angles[:1]
+    vals_plot = values + values[:1]
+
     ax.set_theta_offset(np.pi / 2)
     ax.set_theta_direction(-1)
-    plt.xticks(angles[:-1], labels, color='#333', size=10)
-    ax.set_rlabel_position(0)
-    ax.plot(angles, vals, linewidth=2, linestyle='solid', color='#2b7fc1')
-    ax.fill(angles, vals, color='#2b7fc1', alpha=0.25)
+
+    # 1. Set the ticks at the calculated angles
+    ax.set_xticks(angles)
+    
+    # 2. Set the labels (Strengths) instead of degrees
+    # Added padding so text doesn't overlap the web
+    ax.set_xticklabels(labels, size=11, color='#333', fontweight='bold')
+
+    # 3. Clean up radial labels (y-axis)
+    # Hide the 0.2, 0.4, etc. numbers to focus on the shape/strength aspect
+    ax.set_yticks([0.25, 0.5, 0.75])
+    ax.set_yticklabels([]) # Hides the text labels
+    
+    # Ensure range is 0 to 1
     ax.set_ylim(0, 1)
+
+    # Plot data
+    ax.plot(angles_plot, vals_plot, linewidth=2, linestyle='solid', color='#2b7fc1')
+    ax.fill(angles_plot, vals_plot, color='#2b7fc1', alpha=0.25)
+
     if title:
-        ax.set_title(title, y=1.08, fontsize=12)
+        # Move title slightly up
+        ax.set_title(title, y=1.1, fontsize=12, fontweight='bold', color='#111')
 
 def fmt_pct_val(x):
     if x is None: return "n/a"
@@ -335,11 +355,18 @@ def render_infographic(playbook_result):
     ax_checklist_panels = [fig.add_subplot(gs[3+i, 3:6]) for i in range(2)]
     ax_price = fig.add_subplot(gs[5, 0:6])
 
+    # -------------------------------------------------------------
+    # CUSTOMIZATION: Name + Disclaimer in Header
+    # -------------------------------------------------------------
     ax_header.axis('off')
     ax_header.text(0.01, 0.7, company, fontsize=20, fontweight='bold', color='#111')
     ax_header.text(0.01, 0.48, f"{ticker_used}   |   Sector: {sector}", fontsize=11, color='#444')
     ax_header.text(0.01, 0.28, f"Price: {human_readable_price(price, price_ccy)}    MarketCap: {human_readable_marketcap(mcap, mcap_ccy)}", fontsize=11, color='#333')
-    ax_header.text(0.01, 0.08, f"Report generated: {datetime.utcnow().strftime('%Y-%m-%d')}", fontsize=9, color='#666')
+    ax_header.text(0.01, 0.08, f"Report generated: {datetime.utcnow().strftime('%Y-%m-%d')} | Analysis by Sai Advaith Parimisetti", fontsize=9, color='#666')
+    
+    # Disclaimer on the image itself
+    ax_header.text(0.01, -0.15, "Disclaimer: For informational purposes only. Not financial advice.", fontsize=7, color='#999', ha='left')
+
 
     ax_right.axis('off')
     ax_right.add_patch(patches.Rectangle((0.02, 0.12), 0.96, 0.76, color='#fafafa', ec='#e6e6e6'))
@@ -475,6 +502,22 @@ with st.sidebar:
             <small style="color:#2D7A3E;">• Use exact ticker symbols<br>• Results refresh daily<br>• Download high-res charts</small>
         </div>
     ''', unsafe_allow_html=True)
+    
+    # -------------------------------------------------------------
+    # CUSTOMIZATION: Added sidebar credits for the website
+    # -------------------------------------------------------------
+    st.markdown("---")
+    st.markdown(
+        """
+        <div style='text-align: center; color: #6B7280; font-size: 12px; margin-top: 10px;'>
+            Developed by<br>
+            <strong style='color: #81C784; font-size: 14px;'>Sai Advaith Parimisetti</strong>
+            <br><br>
+            <em style='font-size: 10px;'>Disclaimer: This tool is for educational purposes only and does not constitute financial advice.</em>
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
 
 # Main
 if run_btn:
