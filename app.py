@@ -13,6 +13,7 @@ import seaborn as sns
 import io
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
+import concurrent.futures  # NEW: For parallel processing
 
 # Optional PDF export support
 try:
@@ -55,6 +56,52 @@ def _get_currency_symbol(currency_code):
     if not currency_code: return ""
     return _CURRENCY_SYMBOLS.get(currency_code.upper(), currency_code.upper() + " ")
 
+# CACHED: Currency rates don't change every second
+@st.cache_data(ttl=3600)
+def get_currency_rate(from_currency, to_currency="USD"):
+    if not from_currency or from_currency.upper() == to_currency.upper():
+        return 1.0
+    pair = f"{from_currency.upper()}{to_currency.upper()}=X"
+    try:
+        ticker = yf.Ticker(pair)
+        hist = ticker.history(period="1d")
+        if not hist.empty:
+            return hist['Close'].iloc[-1]
+    except:
+        pass
+    return 1.0
+
+def format_large_number(n):
+    if n is None: return "N/A"
+    try:
+        n = float(n)
+        if abs(n) >= 1e12: return f"{n/1e12:.2f}T"
+        if abs(n) >= 1e9: return f"{n/1e9:.2f}B"
+        if abs(n) >= 1e6: return f"{n/1e6:.2f}M"
+        if abs(n) >= 1e3: return f"{n/1e3:.2f}K"
+        return f"{n:,.2f}"
+    except: return str(n)
+
+def clean_financial_df(df):
+    """Beautifies financial dataframes: transpose, format numbers, fix headers"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    
+    # Transpose so Metrics are Rows and Dates are Columns
+    df_T = df.transpose()
+    
+    # Sort columns (dates) descending (newest first)
+    df_T = df_T[sorted(df_T.columns, reverse=True)]
+    
+    # Format the dates in columns to simply YYYY-MM-DD
+    df_T.columns = [d.strftime('%Y-%m-%d') if isinstance(d, datetime) else str(d) for d in df_T.columns]
+    
+    # Format the numeric values
+    for col in df_T.columns:
+        df_T[col] = df_T[col].apply(lambda x: format_large_number(x) if isinstance(x, (int, float)) else x)
+        
+    return df_T
+
 def human_readable_inr(value):
     if value is None: return "n/a"
     try:
@@ -74,7 +121,7 @@ def human_readable_generic(value, currency_code=None):
         return f"{sym}{n:.2f}"
     except Exception: return str(value)
 
-def human_readable_marketcap(value, currency_code=None, show_usd_equiv=False):
+def human_readable_marketcap(value, currency_code=None):
     if value is None: return "n/a"
     currency = (currency_code or "").upper()
     if currency in ("INR", "₹"):
@@ -119,6 +166,8 @@ def get_yf_ticker_variants(base_ticker, country_code):
             out.append(v); seen.add(v)
     return out
 
+# CACHED: Fetching ticker info is the most expensive operation
+@st.cache_data(ttl=3600)
 def fetch_info_with_variants(base_ticker, country_code):
     tried = []
     variants = get_yf_ticker_variants(base_ticker, country_code)
@@ -126,9 +175,9 @@ def fetch_info_with_variants(base_ticker, country_code):
         try:
             t = yf.Ticker(variant)
             info = t.info
-            # Basic check to see if we got valid data
+            # Validation: ensure we got meaningful data
             if info and (info.get("regularMarketPrice") is not None or info.get("symbol") or info.get("shortName")):
-                return t, info, variant
+                return info, variant
         except Exception:
             tried.append(variant)
     raise RuntimeError(f"No usable yfinance data found. Tried: {variants}")
@@ -150,44 +199,28 @@ def fetch_screener_in(ticker_base):
         return facts
     except: return {}
 
-# --- FALLBACK NEWS FETCHING (GOOGLE RSS) ---
 def fetch_news_fallback(ticker):
-    """
-    Fetches news from Google News RSS if yfinance fails.
-    """
     news_items = []
     try:
-        # Create a search query for the ticker
         query = f"{ticker} stock news"
         url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-        
-        r = requests.get(url, timeout=4)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        r = requests.get(url, headers=headers, timeout=6)
         soup = BeautifulSoup(r.content, features="xml")
         items = soup.findAll('item')
-        
-        for item in items[:5]: # Top 5 only
+        for item in items[:5]: 
             try:
                 title = item.title.text
                 link = item.link.text
                 pub_date = item.pubDate.text
-                # Convert pubDate to simple string if possible, else keep original
                 try:
                     dt = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %Z")
                     date_str = dt.strftime("%Y-%m-%d")
                 except:
                     date_str = "Recent"
-                
-                news_items.append({
-                    'title': title,
-                    'link': link,
-                    'publisher': 'Google News',
-                    'providerPublishTime': date_str 
-                })
-            except:
-                continue
-    except Exception:
-        pass
-    
+                news_items.append({'title': title, 'link': link, 'publisher': 'Google News', 'providerPublishTime': date_str})
+            except: continue
+    except Exception: pass
     return news_items
 
 # --- SCORING LOGIC ---
@@ -201,9 +234,7 @@ def score_undervalued_from_info(info):
     dte = safe_numeric(info.get("debtToEquity"))
     rev_growth = safe_numeric(info.get("revenueGrowth"))
     div_yield = safe_numeric(info.get("dividendYield"))
-
-    details.update({"pe": pe, "pb": pb, "roe": roe, "roic": roic, "debtToEquity": dte,
-                    "revenueGrowth": rev_growth, "dividendYield": div_yield})
+    details.update({"pe": pe, "pb": pb, "roe": roe, "roic": roic, "debtToEquity": dte, "revenueGrowth": rev_growth, "dividendYield": div_yield})
 
     if pe and pe > 0:
         if pe < 15: score += 8
@@ -233,9 +264,7 @@ def score_multibagger_from_info(info):
     rev_growth = safe_numeric(info.get("revenueGrowth"))
     gross = safe_numeric(info.get("grossMargins"))
     opm = safe_numeric(info.get("operatingMargins"))
-
-    details.update({"marketCap": market_cap, "eps_growth": eps_growth, "roe": roe, "roic": roic,
-                    "payoutRatio": payout, "revenueGrowth": rev_growth, "grossMargins": gross, "operatingMargins": opm})
+    details.update({"marketCap": market_cap, "eps_growth": eps_growth, "roe": roe, "roic": roic, "payoutRatio": payout, "revenueGrowth": rev_growth, "grossMargins": gross, "operatingMargins": opm})
 
     if market_cap is not None and market_cap < 2e9: score += 7
     if eps_growth is not None:
@@ -255,12 +284,17 @@ def score_multibagger_from_info(info):
     if opm is not None and opm > 0.15: score += 3
     return score, details
 
+# CACHED: Main entry point for analysis
+@st.cache_data(ttl=3600)
 def run_playbook_for_ticker(ticker_input, country_code=""):
     try:
-        yf_obj, info, used_variant = fetch_info_with_variants(ticker_input, country_code)
+        # fetch_info_with_variants is cached, so we just get dict/str
+        info, used_variant = fetch_info_with_variants(ticker_input, country_code)
     except Exception as e:
-        st.error(f"Could not fetch data for {ticker_input}: {e}")
         return None
+
+    # Re-instantiate Ticker object here (cheap operation) for access to history/financials later
+    yf_obj = yf.Ticker(used_variant)
 
     screener_facts = {}
     if country_code and country_code.upper() == "IN":
@@ -269,15 +303,11 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
     u_score, u_details = score_undervalued_from_info(info)
     m_score, m_details = score_multibagger_from_info(info)
 
-    decisions = {
-        "undervalued_pass": u_score >= 25,
-        "multibagger_pass": m_score >= 30
-    }
-
     summary = {
         "ticker_requested": ticker_input,
         "ticker_used": used_variant,
-        "yf_object": yf_obj,
+        # Note: We cannot cache the yf_object itself easily in st.cache_data, 
+        # so we store the info dict and re-create the object when needed.
         "company": info.get("shortName") or info.get("longName") or used_variant,
         "price": safe_numeric(info.get("regularMarketPrice")),
         "price_currency": info.get("currency"),
@@ -288,23 +318,28 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
         "undervalued_details": u_details,
         "multibagger_score": m_score,
         "multibagger_details": m_details,
-        "screener_facts": screener_facts,
-        "decisions": decisions,
+        "decisions": {"undervalued_pass": u_score >= 25, "multibagger_pass": m_score >= 30},
         "fetched_info": info,
         "as_of": datetime.utcnow().isoformat() + "Z"
     }
     return summary
 
-# --- CHARTING HELPER: RSI CALCULATION ---
 def calculate_rsi(data, window=14):
     delta = data.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
     rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+    return 100 - (100 / (1 + rs))
 
-# --- PLOTTING UTILS (STATIC INFOGRAPHIC) ---
+def calculate_macd(data, slow=26, fast=12, signal=9):
+    exp1 = data.ewm(span=fast, adjust=False).mean()
+    exp2 = data.ewm(span=slow, adjust=False).mean()
+    macd = exp1 - exp2
+    sig = macd.ewm(span=signal, adjust=False).mean()
+    hist = macd - sig
+    return macd, sig, hist
+
+# --- PLOTTING UTILS (STATIC) ---
 def draw_kpi(ax, title, value, subtitle=None, fontsize=12, small=False):
     ax.axis('off')
     ax.add_patch(patches.Rectangle((0, 0), 1, 1, color='white', ec='#e6e6e6', lw=1, zorder=0))
@@ -341,43 +376,36 @@ def radar_plot(ax, labels, values, title=None):
         ax.set_title(title, y=1.1, fontsize=12, fontweight='bold', color='#111')
 
 def fmt_pct_val(x):
-    if x is None: return "n/a"
     try: return f"{x*100:.1f}%"
-    except: return str(x)
+    except: return "n/a"
 
-def render_infographic(playbook_result):
-    if playbook_result is None:
-        return None
-
+def render_infographic(playbook_result, convert_usd=False, rate=1.0):
+    if playbook_result is None: return None
     s = playbook_result
+    
+    price = s.get('price')
+    mcap = s.get('marketCap')
+    price_ccy = s.get('price_currency')
+    mcap_ccy = s.get('marketCap_currency')
+    
+    if convert_usd:
+        if price: price = price * rate
+        if mcap: mcap = mcap * rate
+        price_ccy = "USD"
+        mcap_ccy = "USD"
+
     company = s.get('company') or s.get('ticker_used')
     ticker_used = s.get('ticker_used')
-    price = s.get('price')
-    price_ccy = s.get('price_currency')
-    mcap = s.get('marketCap')
-    mcap_ccy = s.get('marketCap_currency')
     sector = s.get('sector') or "N/A"
-
     u_score = s.get('undervalued_score') or 0
     m_score = s.get('multibagger_score') or 0
     u_pct = max(0, min(1, u_score / 40.0))
     m_pct = max(0, min(1, m_score / 50.0))
-
     u_details = s.get('undervalued_details', {})
     m_details = s.get('multibagger_details', {})
-
-    checklist = [
-        ("Price < Intrinsic", s['decisions']['undervalued_pass']),
-        ("Debt/Equity < 0.5", (u_details.get('debtToEquity') is not None and u_details.get('debtToEquity') < 0.5)),
-        ("ROE > 15%", (u_details.get('roe') is not None and u_details.get('roe') > 0.15)),
-        ("Rev growth > 5%", (u_details.get('revenueGrowth') is not None and u_details.get('revenueGrowth') > 0.05)),
-        ("Small-cap < $2B", (m_details.get('marketCap') is not None and m_details.get('marketCap') < 2e9)),
-        ("EPS Accel > 20%", (m_details.get('eps_growth') is not None and m_details.get('eps_growth') > 0.2)),
-    ]
-
+    
     fig = plt.figure(constrained_layout=True, figsize=(14,10))
     gs = GridSpec(6, 6, figure=fig)
-
     ax_header = fig.add_subplot(gs[0, :4])
     ax_right = fig.add_subplot(gs[0, 4:])
     ax_kpi_1 = fig.add_subplot(gs[1, 0])
@@ -390,7 +418,6 @@ def render_infographic(playbook_result):
     ax_checklist_panels = [fig.add_subplot(gs[3+i, 3:6]) for i in range(2)]
     ax_price = fig.add_subplot(gs[5, 0:6])
 
-    # Name + Disclaimer in Header
     ax_header.axis('off')
     ax_header.text(0.01, 0.7, company, fontsize=20, fontweight='bold', color='#111')
     ax_header.text(0.01, 0.48, f"{ticker_used}   |   Sector: {sector}", fontsize=11, color='#444')
@@ -410,26 +437,21 @@ def render_infographic(playbook_result):
     draw_kpi(ax_kpi_2, "Market Cap", human_readable_marketcap(mcap, mcap_ccy))
     draw_kpi(ax_kpi_3, "Undervalued", f"{u_score}/40", subtitle=f"{int(u_pct*100)}%")
     draw_kpi(ax_kpi_4, "Multibagger", f"{m_score}/50", subtitle=f"{int(m_pct*100)}%")
-
     gauge_bar(ax_gauge_u, u_pct, "Undervalued Score")
     gauge_bar(ax_gauge_m, m_pct, "Multibagger Score")
 
     valuation_comp = 0.0
     pe_val = u_details.get('pe')
     if pe_val and pe_val > 0: valuation_comp = max(0, min(1, (40 - pe_val) / 40))
-    
     profitability_comp = 0.0
     roe_val = u_details.get('roe')
     if roe_val: profitability_comp = max(0, min(1, roe_val / 0.25))
-
     growth_comp = 0.0
     revg_val = u_details.get('revenueGrowth')
     if revg_val: growth_comp = max(0, min(1, revg_val / 0.25))
-
     balance_comp = 0.0
     dte_val = u_details.get('debtToEquity')
     if dte_val: balance_comp = max(0, min(1, 1 - (dte_val / 2.0)))
-
     moat_comp = 0.0
     gm = m_details.get('grossMargins')
     if gm: moat_comp = max(0, min(1, gm / 0.60))
@@ -437,6 +459,15 @@ def render_infographic(playbook_result):
     labels = ["Valuation", "Profitability", "Growth", "Balance", "Moat"]
     values = [valuation_comp, profitability_comp, growth_comp, balance_comp, moat_comp]
     radar_plot(ax_radar, labels, values, title="Strength Radar")
+
+    checklist = [
+        ("Price < Intrinsic", s['decisions']['undervalued_pass']),
+        ("Debt/Equity < 0.5", (u_details.get('debtToEquity') is not None and u_details.get('debtToEquity') < 0.5)),
+        ("ROE > 15%", (u_details.get('roe') is not None and u_details.get('roe') > 0.15)),
+        ("Rev growth > 5%", (u_details.get('revenueGrowth') is not None and u_details.get('revenueGrowth') > 0.05)),
+        ("Small-cap < $2B", (m_details.get('marketCap') is not None and m_details.get('marketCap') < 2e9)),
+        ("EPS Accel > 20%", (m_details.get('eps_growth') is not None and m_details.get('eps_growth') > 0.2)),
+    ]
 
     for axc in ax_checklist_panels: axc.axis('off')
     half = (len(checklist)+1)//2
@@ -449,15 +480,12 @@ def render_infographic(playbook_result):
         ax_pos.add_patch(patches.FancyBboxPatch((0.05, y_top-0.12), 0.9, 0.14, boxstyle="round,pad=0.02", color=color, ec=color))
         ax_pos.text(0.07, y_top-0.05, label, va='center', ha='left', color='white', fontsize=10)
 
-    # Static Price History (small one on infographic)
     try:
+        # Re-fetch history for the plot (this is separate from the cached info)
         hist = yf.Ticker(ticker_used).history(period="12mo")
         if hist is not None and not hist.empty:
+            if convert_usd: hist['Close'] = hist['Close'] * rate
             ax_price.plot(hist.index, hist['Close'], label='Close', lw=1.2)
-            ma50 = hist['Close'].rolling(50).mean()
-            ma200 = hist['Close'].rolling(200).mean()
-            ax_price.plot(hist.index, ma50, label='MA50', ls='--', lw=0.9)
-            ax_price.plot(hist.index, ma200, label='MA200', ls='-.', lw=0.9)
             ax_price.set_title(f"Price History (12mo) — {ticker_used}")
             ax_price.legend()
         else:
@@ -498,12 +526,9 @@ hr{ height:1px; background: linear-gradient(90deg,transparent, rgba(255,255,255,
 
 st.markdown(custom_css, unsafe_allow_html=True)
 
-# Header
 col_logo, col_title = st.columns([0.5, 4.5], gap="large")
 with col_logo:
-    st.markdown("""
-    <div style="background:linear-gradient(135deg,#2D7A3E 0%,#1B4D2B 100%); width:80px; height:80px; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:40px;">💹</div>
-    """, unsafe_allow_html=True)
+    st.markdown("""<div style="background:linear-gradient(135deg,#2D7A3E 0%,#1B4D2B 100%); width:80px; height:80px; border-radius:12px; display:flex; align-items:center; justify-content:center; font-size:40px;">💹</div>""", unsafe_allow_html=True)
 with col_title:
     st.markdown("""
     <h1>Automated Equity Research & Valuation Engine</h1>
@@ -513,53 +538,103 @@ with col_title:
 st.markdown("")
 st.markdown('<hr>', unsafe_allow_html=True)
 
-# Sidebar
 with st.sidebar:
     st.markdown('<h3 style="color:#2D7A3E;">Configuration</h3>', unsafe_allow_html=True)
-    st.markdown('<label style="color:#AEE7B1; font-weight:700; margin-bottom:6px; display:block;">🔍 Ticker Symbol</label>', unsafe_allow_html=True)
-    ticker_input = st.text_input('', value='AAPL', placeholder='e.g., AAPL, MSFT, RELIANCE', key='ticker_input', label_visibility='collapsed')
+    ticker_input = st.text_input('', value='AAPL', placeholder='e.g., AAPL, MSFT', key='ticker_input', label_visibility='collapsed')
     country_code = st.selectbox('Market Region', ['US','IN','GB','DE','FR','CA','JP'], index=0)
+    
+    st.markdown("#### Settings")
+    use_usd = st.checkbox("Convert to USD", value=False)
+    
     st.markdown('---')
     run_btn = st.button('▶ Generate Research Report', type='primary', use_container_width=True)
-    st.markdown('')
     
-    # Credits
+    if st.session_state.get('analysis_done', False):
+        st.markdown("")
+        try:
+            summ = st.session_state['summary']
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # Sheet 1: Summary
+                pd.DataFrame([summ]).drop(columns=['fetched_info', 'yf_object'], errors='ignore').astype(str).to_excel(writer, sheet_name='Summary', index=False)
+                
+                # Re-create yf object for export (since we can't pickle it easily)
+                yf_obj_export = yf.Ticker(summ['ticker_used'])
+
+                # Sheet 2-4: Financials
+                if not yf_obj_export.financials.empty: 
+                    clean_financial_df(yf_obj_export.financials).to_excel(writer, sheet_name='Income_Statement')
+                if not yf_obj_export.balance_sheet.empty: 
+                    clean_financial_df(yf_obj_export.balance_sheet).to_excel(writer, sheet_name='Balance_Sheet')
+                if not yf_obj_export.cashflow.empty: 
+                    clean_financial_df(yf_obj_export.cashflow).to_excel(writer, sheet_name='Cash_Flow')
+                
+                # Auto-adjust column widths
+                for sheet in writer.sheets.values():
+                    for column in sheet.columns:
+                        max_length = 0
+                        column = [cell for cell in column]
+                        for cell in column:
+                            try:
+                                if len(str(cell.value)) > max_length:
+                                    max_length = len(str(cell.value))
+                            except: pass
+                        adjusted_width = (max_length + 2)
+                        sheet.column_dimensions[column[0].column_letter].width = adjusted_width
+
+            output.seek(0)
+            st.download_button('📥 Download Excel Report', data=output, file_name=f"{summ['ticker_used']}_full_report.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
+        except Exception as e:
+            # st.warning(f"Export error: {e}")
+            st.warning("Export requires 'openpyxl'. Please install it.")
+
     st.markdown("---")
     st.markdown(
-        """
-        <div style='text-align: center; color: #6B7280; font-size: 12px; margin-top: 10px;'>
-            Developed by<br>
-            <strong style='color: #81C784; font-size: 14px;'>Sai Advaith Parimisetti</strong>
-            <br><br>
-            <em style='font-size: 10px;'>Disclaimer: This tool is for educational purposes only and does not constitute financial advice.</em>
-        </div>
-        """, 
-        unsafe_allow_html=True
-    )
+        """<div style='text-align: center; color: #6B7280; font-size: 12px; margin-top: 10px;'>
+            Developed by<br><strong style='color: #81C784; font-size: 14px;'>Sai Advaith Parimisetti</strong>
+            <br><br><em style='font-size: 10px;'>Disclaimer: This tool is for educational purposes only and does not constitute financial advice.</em>
+        </div>""", unsafe_allow_html=True)
 
-# --- APP LOGIC WITH SESSION STATE ---
+# --- APP LOGIC ---
 
-# If the user clicks the run button, fetch new data and save it to session_state
 if run_btn:
     with st.spinner(f"📊 Analyzing {ticker_input}..."):
         summary = run_playbook_for_ticker(ticker_input, country_code)
         if summary:
+            # Handle currency conversion rate once
+            rate = 1.0
+            if use_usd and summary['price_currency'] != 'USD':
+                rate = get_currency_rate(summary['price_currency'], 'USD')
+            
             st.session_state['summary'] = summary
+            st.session_state['usd_rate'] = rate
+            st.session_state['use_usd'] = use_usd
             st.session_state['analysis_done'] = True
+            st.rerun()
         else:
             st.session_state['analysis_done'] = False
 
-# Check if we have valid analysis data in the session
 if st.session_state.get('analysis_done', False) and 'summary' in st.session_state:
     summary = st.session_state['summary']
+    rate = st.session_state.get('usd_rate', 1.0)
+    using_usd = st.session_state.get('use_usd', False)
 
-    # --- Metrics ---
+    # Re-instantiate yf object locally for UI elements that need it
+    yf_obj = yf.Ticker(summary['ticker_used'])
+    # Inject it back into summary wrapper for consistency in helper calls
+    summary['yf_object'] = yf_obj 
+
+    # Apply conversion for metrics display
+    disp_price = summary['price'] * rate if using_usd and summary['price'] else summary['price']
+    disp_mcap = summary['marketCap'] * rate if using_usd and summary['marketCap'] else summary['marketCap']
+    disp_ccy = "USD" if using_usd else summary['price_currency']
+
     st.markdown('<h3 style="color:#1B4D2B;">Key Metrics</h3>', unsafe_allow_html=True)
     col1, col2, col3, col4 = st.columns(4, gap='medium')
     with col1:
-        st.metric('💰 Current Price', human_readable_price(summary['price'], summary['price_currency']))
+        st.metric('💰 Current Price', human_readable_price(disp_price, disp_ccy))
     with col2:
-        st.metric('📈 Market Cap', human_readable_marketcap(summary['marketCap'], summary['marketCap_currency']))
+        st.metric('📈 Market Cap', human_readable_marketcap(disp_mcap, disp_ccy))
     with col3:
         underval_pct = min(100, int((summary['undervalued_score'] / 40) * 100))
         st.metric('🎯 Undervalued', f"{summary['undervalued_score']}/40", f"{underval_pct}%")
@@ -570,195 +645,275 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
     st.markdown('')
     
     # --- TABS ---
-    tab1, tab2, tab3 = st.tabs(["📊 Visual Report", "📈 Interactive Chart", "📋 Fundamental Analysis"])
+    tab1, tab2, tab3, tab4 = st.tabs(["📊 Visual Report", "📈 Interactive Chart", "📋 Fundamental Analysis", "⚖️ Peer Comparison"])
     
-    # TAB 1: Infographic
     with tab1:
         st.markdown('<h3 style="color:#1B4D2B;">Visual Analysis Report</h3>', unsafe_allow_html=True)
-        fig = render_infographic(summary)
+        fig = render_infographic(summary, convert_usd=using_usd, rate=rate)
         if fig:
             st.pyplot(fig, use_container_width=True)
             fn = f"{summary['ticker_used']}_equity_research.png"
             img = io.BytesIO()
             fig.savefig(img, format='png', bbox_inches='tight', dpi=150)
             img.seek(0)
+            plt.close(fig) # MEMORY FIX: Close figure
             st.markdown('<hr>', unsafe_allow_html=True)
             col_d1, col_d2, col_d3 = st.columns([1,1.5,1])
             with col_d2:
                 st.download_button('📥 Download High-Resolution Report', data=img, file_name=fn, mime='image/png', use_container_width=True)
 
-    # TAB 2: MAX FEATURE CHART
     with tab2:
         st.markdown('<h3 style="color:#1B4D2B;">Advanced Technical Chart</h3>', unsafe_allow_html=True)
-        
-        # Chart Controls
         col_c1, col_c2, col_c3 = st.columns(3)
         with col_c1:
-            chart_period = st.selectbox("Timeframe", ["1y", "2y", "5y", "10y", "max"], index=1)
+            chart_period = st.selectbox("Timeframe", ["1y", "2y", "5y", "10y", "max"], index=1, key="chart_period_box")
         with col_c2:
-            indicators = st.multiselect("Overlays", ["SMA 50", "SMA 200", "Bollinger Bands"], default=["SMA 50"])
+            indicators = st.multiselect("Overlays", ["SMA 50", "SMA 200", "Bollinger Bands"], default=["SMA 50"], key="chart_indicators_box")
         with col_c3:
-            oscillator = st.selectbox("Bottom Panel", ["Volume", "RSI"], index=0)
+            oscillator = st.selectbox("Bottom Panel", ["Volume", "RSI", "MACD"], index=0, key="chart_oscillator_box")
 
         try:
-            # Fetch History
-            hist = yf.Ticker(summary['ticker_used']).history(period=chart_period)
-            
+            hist = yf_obj.history(period=chart_period)
             if not hist.empty:
-                # Calculation for Overlays
-                if "SMA 50" in indicators:
-                    hist['SMA50'] = hist['Close'].rolling(window=50).mean()
-                if "SMA 200" in indicators:
-                    hist['SMA200'] = hist['Close'].rolling(window=200).mean()
+                if "SMA 50" in indicators: hist['SMA50'] = hist['Close'].rolling(window=50).mean()
+                if "SMA 200" in indicators: hist['SMA200'] = hist['Close'].rolling(window=200).mean()
                 if "Bollinger Bands" in indicators:
                     hist['MA20'] = hist['Close'].rolling(window=20).mean()
                     hist['STD20'] = hist['Close'].rolling(window=20).std()
                     hist['BB_Upper'] = hist['MA20'] + (hist['STD20'] * 2)
                     hist['BB_Lower'] = hist['MA20'] - (hist['STD20'] * 2)
 
-                # Create Subplots
-                fig_plotly = make_subplots(rows=2, cols=1, shared_xaxes=True, 
-                                            vertical_spacing=0.05, row_heights=[0.7, 0.3],
-                                            subplot_titles=(f"{summary['ticker_used']} Price", oscillator))
+                row_heights = [0.7, 0.3]
+                fig_plotly = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=row_heights, subplot_titles=(f"{summary['ticker_used']} Price", oscillator))
 
-                # 1. Price Candle
-                fig_plotly.add_trace(go.Candlestick(x=hist.index,
-                                open=hist['Open'], high=hist['High'],
-                                low=hist['Low'], close=hist['Close'],
-                                name='Price'), row=1, col=1)
+                # Price Candle
+                fig_plotly.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name='Price'), row=1, col=1)
 
-                # 2. Add Overlays
-                if "SMA 50" in indicators:
-                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA50'], 
-                                            line=dict(color='orange', width=1.5), name='SMA 50'), row=1, col=1)
-                if "SMA 200" in indicators:
-                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA200'], 
-                                            line=dict(color='blue', width=1.5), name='SMA 200'), row=1, col=1)
+                # Overlays
+                if "SMA 50" in indicators: fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA50'], line=dict(color='orange', width=1.5), name='SMA 50'), row=1, col=1)
+                if "SMA 200" in indicators: fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA200'], line=dict(color='blue', width=1.5), name='SMA 200'), row=1, col=1)
                 if "Bollinger Bands" in indicators:
-                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Upper'], 
-                                            line=dict(color='gray', width=1, dash='dot'), name='BB Upper', showlegend=False), row=1, col=1)
-                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Lower'], 
-                                            line=dict(color='gray', width=1, dash='dot'), fill='tonexty', 
-                                            fillcolor='rgba(128,128,128,0.1)', name='Bollinger Bands'), row=1, col=1)
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Upper'], line=dict(color='gray', width=1, dash='dot'), showlegend=False), row=1, col=1)
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Lower'], line=dict(color='gray', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(128,128,128,0.1)', name='BB'), row=1, col=1)
 
-                # 3. Add Oscillator
+                # Oscillators
                 if oscillator == "Volume":
-                    fig_plotly.add_trace(go.Bar(x=hist.index, y=hist['Volume'], 
-                                        marker_color='teal', name='Volume'), row=2, col=1)
+                    fig_plotly.add_trace(go.Bar(x=hist.index, y=hist['Volume'], marker_color='teal', name='Volume'), row=2, col=1)
                 elif oscillator == "RSI":
                     hist['RSI'] = calculate_rsi(hist['Close'])
-                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], 
-                                            line=dict(color='purple', width=2), name='RSI'), row=2, col=1)
-                    # Add 70/30 Lines
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['RSI'], line=dict(color='purple', width=2), name='RSI'), row=2, col=1)
                     fig_plotly.add_hline(y=70, line_dash="dash", line_color="red", row=2, col=1)
                     fig_plotly.add_hline(y=30, line_dash="dash", line_color="green", row=2, col=1)
+                elif oscillator == "MACD":
+                    macd, sig, hist_macd = calculate_macd(hist['Close'])
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=macd, line=dict(color='cyan', width=1.5), name='MACD'), row=2, col=1)
+                    fig_plotly.add_trace(go.Scatter(x=hist.index, y=sig, line=dict(color='orange', width=1.5), name='Signal'), row=2, col=1)
+                    fig_plotly.add_trace(go.Bar(x=hist.index, y=hist_macd, marker_color='gray', name='Hist'), row=2, col=1)
 
-                # Layout Tuning
-                fig_plotly.update_layout(
-                    template='plotly_dark',
-                    height=700,
-                    xaxis_rangeslider_visible=False,
-                    margin=dict(l=0, r=0, t=30, b=0)
-                )
+                fig_plotly.update_layout(template='plotly_dark', height=700, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=30, b=0))
                 st.plotly_chart(fig_plotly, use_container_width=True)
             else:
                 st.warning("No price history available.")
         except Exception as e:
             st.error(f"Error creating chart: {e}")
 
-    # TAB 3: Analysis & News
     with tab3:
-        st.markdown('<h3 style="color:#1B4D2B;">Company Profile & News</h3>', unsafe_allow_html=True)
+        st.markdown('<h3 style="color:#1B4D2B;">Deep Dive Analysis</h3>', unsafe_allow_html=True)
         info = summary['fetched_info']
-        
-        col_info_1, col_info_2 = st.columns([2, 1])
-        
-        with col_info_1:
-            st.markdown("#### Business Summary")
-            if 'longBusinessSummary' in info:
-                st.info(info['longBusinessSummary'])
-            else:
-                st.info("No business summary available.")
-                
-        with col_info_2:
-            st.markdown("#### Key Data")
-            stats_df = pd.DataFrame({
-                "Metric": ["Sector", "Industry", "Employees", "Website"],
-                "Value": [
-                    info.get('sector', 'N/A'),
-                    info.get('industry', 'N/A'),
-                    info.get('fullTimeEmployees', 'N/A'),
-                    info.get('website', 'N/A')
-                ]
-            })
-            st.table(stats_df)
 
-        st.markdown("---")
-        st.markdown("#### 📰 Latest News")
+        subtab_info, subtab_fin, subtab_rec, subtab_news = st.tabs(["🏢 Profile", "💵 Financial Statements", "🎯 Analyst Ratings", "📰 News"])
         
-        # --- ROBUST NEWS FETCHING LOGIC ---
-        valid_news_count = 0
-        
-        # 1. Try yfinance first
-        try:
-            yf_news = summary['yf_object'].news
-            if yf_news and isinstance(yf_news, list):
-                for item in yf_news[:5]:
-                    if not isinstance(item, dict): continue
-                    
-                    title = item.get('title')
-                    if not title: continue # Skip if no title
-                    
-                    link = item.get('link', '#')
-                    publisher = item.get('publisher', 'Yahoo Finance')
-                    
-                    # Time formatting
-                    pub_time_raw = item.get('providerPublishTime')
-                    pub_time_str = "Recent"
-                    if pub_time_raw:
-                        try:
-                            pub_time_str = datetime.fromtimestamp(pub_time_raw).strftime('%Y-%m-%d %H:%M')
-                        except: pass
-                    
+        with subtab_info:
+            col_info_1, col_info_2 = st.columns([2, 1])
+            with col_info_1:
+                st.markdown("#### Business Summary")
+                st.info(info.get('longBusinessSummary', "No summary available."))
+            with col_info_2:
+                st.markdown("#### Key Data")
+                st.table(pd.DataFrame({
+                    "Metric": ["Sector", "Industry", "Employees", "Website"],
+                    "Value": [info.get('sector', 'N/A'), info.get('industry', 'N/A'), info.get('fullTimeEmployees', 'N/A'), info.get('website', 'N/A')]
+                }))
+
+        with subtab_fin:
+            st.markdown("#### Financial Statements (Annual)")
+            fin_type = st.selectbox("Select Statement", ["Income Statement", "Balance Sheet", "Cash Flow"])
+            try:
+                if fin_type == "Income Statement": 
+                    st.dataframe(clean_financial_df(yf_obj.financials), use_container_width=True)
+                elif fin_type == "Balance Sheet": 
+                    st.dataframe(clean_financial_df(yf_obj.balance_sheet), use_container_width=True)
+                elif fin_type == "Cash Flow": 
+                    st.dataframe(clean_financial_df(yf_obj.cashflow), use_container_width=True)
+            except: st.warning("Financial data unavailable.")
+
+        with subtab_rec:
+            st.markdown("#### Analyst Consensus")
+            
+            # 1. Fetch Recommendation Mean (Score 1.0 - 5.0)
+            rec_mean = info.get('recommendationMean')
+            rec_key = info.get('recommendationKey', '').replace('_', ' ').title() # e.g., "Strong Buy"
+            
+            if rec_mean:
+                col_gauge, col_text = st.columns([2, 1])
+                
+                with col_gauge:
+                    # LOGIC INVERSION: 
+                    # Standard Yahoo: 1 = Strong Buy (Left), 5 = Strong Sell (Right)
+                    # Your Request:   Sell on Left, Buy on Right.
+                    # Math: New_Value = 6 - Old_Value (e.g., Old 1 becomes 5)
+                    plot_value = 6 - rec_mean
+
+                    # Create Speedometer
+                    fig_gauge = go.Figure(go.Indicator(
+                        mode = "gauge+number",
+                        value = plot_value, 
+                        domain = {'x': [0, 1], 'y': [0, 1]},
+                        title = {'text': f"Consensus: {rec_key}", 'font': {'size': 24, 'color': '#AEE7B1'}},
+                        # Display the ORIGINAL score (1-5) in the center, or remove standard number if confusing
+                        number = {'font': {'size': 40, 'color': 'white'}, 'suffix': " Score"}, 
+                        gauge = {
+                            'axis': {
+                                'range': [1, 5], 
+                                'tickwidth': 1, 
+                                'tickcolor': "white", 
+                                # LABELS REVERSED: Sell on Left (1), Buy on Right (5)
+                                'ticktext': ['Strong Sell', 'Sell', 'Hold', 'Buy', 'Strong Buy'], 
+                                'tickvals': [1, 2, 3, 4, 5]
+                            },
+                            'bar': {'color': "white", 'thickness': 0.02}, # Thin needle
+                            'bgcolor': "rgba(0,0,0,0)",
+                            'borderwidth': 0,
+                            # COLORS REVERSED: Red on Left, Green on Right
+                            'steps': [
+                                {'range': [1, 1.8], 'color': "#FF0000"},    # Strong Sell (Red)
+                                {'range': [1.8, 2.6], 'color': "#FF8C00"},  # Sell (Orange)
+                                {'range': [2.6, 3.4], 'color': "#FFD700"},  # Hold (Yellow)
+                                {'range': [3.4, 4.2], 'color': "#88E338"},  # Buy (Light Green)
+                                {'range': [4.2, 5], 'color': "#00C805"}     # Strong Buy (Green)
+                            ],
+                            'threshold': {
+                                'line': {'color': "white", 'width': 4},
+                                'thickness': 0.75,
+                                'value': plot_value
+                            }
+                        }
+                    ))
+                    # MARGIN FIX: Increased 't' (top) from 40 to 80 to prevent title cutoff
+                    fig_gauge.update_layout(
+                        paper_bgcolor = "rgba(0,0,0,0)", 
+                        font = {'color': "white", 'family': "Inter"}, 
+                        height=350, 
+                        margin=dict(l=30, r=30, t=80, b=20) 
+                    )
+                    st.plotly_chart(fig_gauge, use_container_width=True)
+
+                with col_text:
                     st.markdown(f"""
-                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px; margin-bottom: 12px; border-left: 4px solid #2D7A3E;">
-                        <a href="{link}" target="_blank" style="color: #AEE7B1; font-weight: 600; text-decoration: none; font-size: 16px; display:block; margin-bottom:4px;">{title}</a>
-                        <div style="color: #9CA3AF; font-size: 12px;">{pub_time_str} • <span style="color:#81C784;">{publisher}</span></div>
+                    <div style="background: rgba(255,255,255,0.05); border-radius: 10px; padding: 20px; margin-top: 60px;">
+                        <div style="font-size: 14px; color: #888;">Number of Analysts</div>
+                        <div style="font-size: 24px; font-weight: bold; color: #E6F0EA;">{info.get('numberOfAnalystOpinions', 'N/A')}</div>
+                        <br>
+                        <div style="font-size: 14px; color: #888;">Actual Yahoo Score</div>
+                        <div style="font-size: 18px; font-weight: bold; color: #AEE7B1;">{rec_mean}</div>
+                        <div style="font-size: 10px; color: #666;">(1.0 = Strong Buy)</div>
                     </div>
                     """, unsafe_allow_html=True)
-                    valid_news_count += 1
-        except Exception:
-            pass
-        
-        # 2. If yfinance returned 0 valid items, FALLBACK to Google News RSS
-        if valid_news_count == 0:
-            fallback_news = fetch_news_fallback(summary['ticker_used'])
-            if fallback_news:
-                for item in fallback_news:
-                    st.markdown(f"""
-                    <div style="background: rgba(255,255,255,0.05); padding: 12px; border-radius: 8px; margin-bottom: 12px; border-left: 4px solid #F59E0B;">
-                        <a href="{item['link']}" target="_blank" style="color: #FCD34D; font-weight: 600; text-decoration: none; font-size: 16px; display:block; margin-bottom:4px;">{item['title']}</a>
-                        <div style="color: #9CA3AF; font-size: 12px;">{item['providerPublishTime']} • <span style="color:#FBBF24;">{item['publisher']}</span></div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                valid_news_count = len(fallback_news)
+
             else:
-                st.info("No news found from standard sources.")
+                st.info("No sufficient analyst data to generate a gauge.")
+
+            # 2. Price Target Metric
+            target = info.get('targetMeanPrice')
+            current = info.get('regularMarketPrice')
+            if target and current:
+                delta = ((target - current) / current) * 100
+                st.markdown("---")
+                st.metric("Mean Analyst Price Target", human_readable_price(target, summary['price_currency']), f"{delta:.2f}% Upside")
+
+        with subtab_news:
+            valid_news_count = 0
+            try:
+                yf_news = yf_obj.news
+                if yf_news and isinstance(yf_news, list):
+                    for item in yf_news[:5]:
+                        if not isinstance(item, dict): continue
+                        title = item.get('title')
+                        if not title: continue
+                        link = item.get('link', '#')
+                        publisher = item.get('publisher', 'Yahoo Finance')
+                        pub_time_raw = item.get('providerPublishTime')
+                        pub_time_str = datetime.fromtimestamp(pub_time_raw).strftime('%Y-%m-%d') if pub_time_raw else "Recent"
+                        st.markdown(f"""<div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #2D7A3E;"><a href="{link}" target="_blank" style="color: #AEE7B1; font-weight: bold; text-decoration: none;">{title}</a><div style="color: #888; font-size: 12px;">{pub_time_str} • {publisher}</div></div>""", unsafe_allow_html=True)
+                        valid_news_count += 1
+            except: pass
+            
+            if valid_news_count == 0:
+                fallback_news = fetch_news_fallback(summary['ticker_used'])
+                if fallback_news:
+                    for item in fallback_news:
+                        st.markdown(f"""<div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #F59E0B;"><a href="{item['link']}" target="_blank" style="color: #FCD34D; font-weight: bold; text-decoration: none;">{item['title']}</a><div style="color: #888; font-size: 12px;">{item['providerPublishTime']} • {item['publisher']}</div></div>""", unsafe_allow_html=True)
+                else: st.info("No news found.")
+
+    with tab4:
+        st.markdown('<h3 style="color:#1B4D2B;">Peer Comparison</h3>', unsafe_allow_html=True)
+        peer_input = st.text_input("Enter Peer Tickers (comma separated)", placeholder="e.g. MSFT, GOOGL, META")
+        compare_btn = st.button("Compare Peers")
+        
+        # --- NEW PARALLELIZED LOGIC ---
+        if compare_btn and peer_input:
+            peers = [x.strip().upper() for x in peer_input.split(',') if x.strip()]
+            peers.insert(0, summary['ticker_used']) 
+            
+            # Function to run in parallel
+            def fetch_peer_data(p_ticker):
+                try:
+                    p_obj = yf.Ticker(p_ticker)
+                    p_info = p_obj.info
+                    if p_info and 'regularMarketPrice' in p_info:
+                        return {
+                            "Ticker": p_ticker,
+                            "Price": p_info.get('regularMarketPrice'),
+                            "Market Cap": format_large_number(p_info.get('marketCap')),
+                            "P/E Ratio": p_info.get('trailingPE'),
+                            "Forward P/E": p_info.get('forwardPE'),
+                            "P/B Ratio": p_info.get('priceToBook'),
+                            "ROE": p_info.get('returnOnEquity'),
+                            "Rev Growth": p_info.get('revenueGrowth'),
+                            "Div Yield": p_info.get('dividendYield')
+                        }
+                except:
+                    return None
+            
+            comparison_data = []
+            with st.spinner(f"Fetching data for {len(peers)} tickers..."):
+                # Use ThreadPoolExecutor to run fetch_peer_data for all tickers at once
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    results = list(executor.map(fetch_peer_data, peers))
+                
+                # Filter out failures
+                comparison_data = [r for r in results if r is not None]
+
+            if comparison_data:
+                comp_df = pd.DataFrame(comparison_data).set_index("Ticker").transpose()
+                st.dataframe(comp_df, use_container_width=True)
+            else:
+                st.warning("No data found for peers.")
 
 else:
-    # Landing Page
+    # Landing
     col_land_1, col_land_2 = st.columns([1.6,1], gap='large')
     with col_land_1:
         st.markdown('''
         <div style="padding:2rem 0;">
             <h3 style="color:#1B4D2B; font-size:24px;">Welcome to Your Research Hub</h3>
             <p style="color:#6B7280; font-size:16px; line-height:1.8;">Analyze any stock with institutional-grade research tools. Our engine evaluates:</p>
-            <div style="background:#fff; border:1px solid #E5E7EB; border-radius:8px; padding:1.5rem; margin-top:1rem;">
-                <div style="display:flex; align-items:start; margin-bottom:1rem;"><span style="color:#2D7A3E; font-size:20px; margin-right:1rem;">✓</span><div><p style="color:#1B4D2B; font-weight:600; margin:0 0 0.3rem 0;">Valuation Analysis</p><p style="color:#6B7280; font-size:14px; margin:0;">Is the stock trading below intrinsic value?</p></div></div>
-                <div style="display:flex; align-items:start; margin-bottom:1rem;"><span style="color:#2D7A3E; font-size:20px; margin-right:1rem;">✓</span><div><p style="color:#1B4D2B; font-weight:600; margin:0 0 0.3rem 0;">Growth Potential</p><p style="color:#6B7280; font-size:14px; margin:0;">Does it have characteristics of a 10x multibagger?</p></div></div>
-                <div style="display:flex; align-items:start;"><span style="color:#2D7A3E; font-size:20px; margin-right:1rem;">✓</span><div><p style="color:#1B4D2B; font-weight:600; margin:0 0 0.3rem 0;">Financial Health</p><p style="color:#6B7280; font-size:14px; margin:0;">Visualize Moat, Growth, and Balance Sheet strength</p></div></div>
-            </div>
-            <p style="color:#6B7280; font-size:13px; line-height:1.6; margin-top:1rem;"><strong>Getting Started:</strong> Select a ticker symbol and market region in the sidebar, then click "Generate Research Report" to begin your analysis.</p>
+            <ul style="color:#6B7280; font-size:15px; margin-bottom:1.5rem;">
+                <li><strong>Valuation & Growth Scoring</strong>: Proprietary "Undervalued" and "Multibagger" algorithms.</li>
+                <li><strong>Interactive Technicals</strong>: RSI, MACD, Bollinger Bands, and Volume analysis.</li>
+                <li><strong>Deep Fundamental Data</strong>: Access Income Statements, Balance Sheets, and Cash Flows.</li>
+                <li><strong>Peer Benchmarking</strong>: Compare key ratios against competitors instantly.</li>
+            </ul>
         </div>
         ''', unsafe_allow_html=True)
     with col_land_2:
@@ -766,6 +921,6 @@ else:
         <div style="background:linear-gradient(135deg,#EBF8F0 0%,#E8F0ED 100%); border:1px solid #2D7A3E; border-radius:12px; padding:2rem; text-align:center;">
             <div style="font-size:64px; margin-bottom:1rem;">💹</div>
             <h4 style="color:#1B4D2B; margin:0 0 1rem 0; font-size:18px;">Ready to Research?</h4>
-            <p style="color:#6B7280; margin:0; font-size:14px; line-height:1.6;">Start by entering a stock ticker in the sidebar configuration panel to unlock comprehensive equity analysis.</p>
+            <p style="color:#6B7280; margin:0; font-size:14px; line-height:1.6;">Start by entering a stock ticker in the sidebar.</p>
         </div>
         ''', unsafe_allow_html=True)
