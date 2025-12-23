@@ -4,7 +4,7 @@ import pandas as pd
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime, timezone
+from datetime import datetime
 import traceback
 import matplotlib.pyplot as plt
 import matplotlib.patches as patches
@@ -13,29 +13,21 @@ import seaborn as sns
 import io
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import concurrent.futures
-import re
-import html
+import concurrent.futures  # NEW: For parallel processing
 
-# --- DEPENDENCY CHECK ---
+# Optional PDF export support
 try:
-    import openpyxl
-except ImportError:
-    st.error("⚠️ The 'openpyxl' library is missing. Please run `pip install openpyxl` to enable Excel exports.")
+    from reportlab.lib.pagesizes import letter
+    from reportlab.pdfgen import canvas
+    REPORTLAB_AVAILABLE = True
+except Exception:
+    REPORTLAB_AVAILABLE = False
 
 # ==========================================
 # 1. HELPER FUNCTIONS
 # ==========================================
 
 sns.set_style("whitegrid")
-
-TICKER_CORRECTIONS = {
-    "SHELL": "SHEL",
-    "GOOG": "GOOGL",
-    "BRK.B": "BRK-B",
-    "FB": "META",
-    "TWTR": "X"
-}
 
 COUNTRY_SUFFIX_MAP = {
     "IN": [".NS", ".BO"],
@@ -64,7 +56,8 @@ def _get_currency_symbol(currency_code):
     if not currency_code: return ""
     return _CURRENCY_SYMBOLS.get(currency_code.upper(), currency_code.upper() + " ")
 
-@st.cache_data(ttl=3600, show_spinner=False)
+# CACHED: Currency rates don't change every second
+@st.cache_data(ttl=3600)
 def get_currency_rate(from_currency, to_currency="USD"):
     if not from_currency or from_currency.upper() == to_currency.upper():
         return 1.0
@@ -90,13 +83,23 @@ def format_large_number(n):
     except: return str(n)
 
 def clean_financial_df(df):
+    """Beautifies financial dataframes: transpose, format numbers, fix headers"""
     if df is None or df.empty:
         return pd.DataFrame()
+    
+    # Transpose so Metrics are Rows and Dates are Columns
     df_T = df.transpose()
+    
+    # Sort columns (dates) descending (newest first)
     df_T = df_T[sorted(df_T.columns, reverse=True)]
+    
+    # Format the dates in columns to simply YYYY-MM-DD
     df_T.columns = [d.strftime('%Y-%m-%d') if isinstance(d, datetime) else str(d) for d in df_T.columns]
+    
+    # Format the numeric values
     for col in df_T.columns:
         df_T[col] = df_T[col].apply(lambda x: format_large_number(x) if isinstance(x, (int, float)) else x)
+        
     return df_T
 
 def human_readable_inr(value):
@@ -163,7 +166,8 @@ def get_yf_ticker_variants(base_ticker, country_code):
             out.append(v); seen.add(v)
     return out
 
-@st.cache_data(ttl=3600, show_spinner=False)
+# CACHED: Fetching ticker info is the most expensive operation
+@st.cache_data(ttl=3600)
 def fetch_info_with_variants(base_ticker, country_code):
     tried = []
     variants = get_yf_ticker_variants(base_ticker, country_code)
@@ -171,6 +175,7 @@ def fetch_info_with_variants(base_ticker, country_code):
         try:
             t = yf.Ticker(variant)
             info = t.info
+            # Validation: ensure we got meaningful data
             if info and (info.get("regularMarketPrice") is not None or info.get("symbol") or info.get("shortName")):
                 return info, variant
         except Exception:
@@ -279,12 +284,17 @@ def score_multibagger_from_info(info):
     if opm is not None and opm > 0.15: score += 3
     return score, details
 
-@st.cache_data(ttl=3600, show_spinner=False)
+# CACHED: Main entry point for analysis
+@st.cache_data(ttl=3600)
 def run_playbook_for_ticker(ticker_input, country_code=""):
     try:
+        # fetch_info_with_variants is cached, so we just get dict/str
         info, used_variant = fetch_info_with_variants(ticker_input, country_code)
     except Exception as e:
         return None
+
+    # Re-instantiate Ticker object here (cheap operation) for access to history/financials later
+    yf_obj = yf.Ticker(used_variant)
 
     screener_facts = {}
     if country_code and country_code.upper() == "IN":
@@ -296,6 +306,8 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
     summary = {
         "ticker_requested": ticker_input,
         "ticker_used": used_variant,
+        # Note: We cannot cache the yf_object itself easily in st.cache_data, 
+        # so we store the info dict and re-create the object when needed.
         "company": info.get("shortName") or info.get("longName") or used_variant,
         "price": safe_numeric(info.get("regularMarketPrice")),
         "price_currency": info.get("currency"),
@@ -308,7 +320,7 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
         "multibagger_details": m_details,
         "decisions": {"undervalued_pass": u_score >= 25, "multibagger_pass": m_score >= 30},
         "fetched_info": info,
-        "as_of": datetime.now(timezone.utc).isoformat() + "Z"
+        "as_of": datetime.utcnow().isoformat() + "Z"
     }
     return summary
 
@@ -327,7 +339,7 @@ def calculate_macd(data, slow=26, fast=12, signal=9):
     hist = macd - sig
     return macd, sig, hist
 
-# --- PLOTTING UTILS ---
+# --- PLOTTING UTILS (STATIC) ---
 def draw_kpi(ax, title, value, subtitle=None, fontsize=12, small=False):
     ax.axis('off')
     ax.add_patch(patches.Rectangle((0, 0), 1, 1, color='white', ec='#e6e6e6', lw=1, zorder=0))
@@ -410,7 +422,7 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
     ax_header.text(0.01, 0.7, company, fontsize=20, fontweight='bold', color='#111')
     ax_header.text(0.01, 0.48, f"{ticker_used}   |   Sector: {sector}", fontsize=11, color='#444')
     ax_header.text(0.01, 0.28, f"Price: {human_readable_price(price, price_ccy)}    MarketCap: {human_readable_marketcap(mcap, mcap_ccy)}", fontsize=11, color='#333')
-    ax_header.text(0.01, 0.08, f"Report generated: {datetime.now().strftime('%Y-%m-%d')} | Analysis by Sai Advaith Parimisetti", fontsize=9, color='#666')
+    ax_header.text(0.01, 0.08, f"Report generated: {datetime.utcnow().strftime('%Y-%m-%d')} | Analysis by Sai Advaith Parimisetti", fontsize=9, color='#666')
     ax_header.text(0.01, -0.15, "Disclaimer: For informational purposes only. Not financial advice.", fontsize=7, color='#999', ha='left')
 
     ax_right.axis('off')
@@ -469,6 +481,7 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
         ax_pos.text(0.07, y_top-0.05, label, va='center', ha='left', color='white', fontsize=10)
 
     try:
+        # Re-fetch history for the plot (this is separate from the cached info)
         hist = yf.Ticker(ticker_used).history(period="12mo")
         if hist is not None and not hist.empty:
             if convert_usd: hist['Close'] = hist['Close'] * rate
@@ -527,22 +540,13 @@ st.markdown('<hr>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown('<h3 style="color:#2D7A3E;">Configuration</h3>', unsafe_allow_html=True)
-    
-    ticker_input = st.text_input('Ticker Symbol', value='AAPL', placeholder='e.g., AAPL, MSFT', key='ticker_input', label_visibility='collapsed')
-    
-    if ticker_input and not re.match(r'^[A-Za-z0-9.=-]+$', ticker_input):
-        st.warning("⚠️ Invalid characters in ticker. Use letters, numbers, dots, or hyphens only.")
-        st.stop()
-    
+    ticker_input = st.text_input('', value='AAPL', placeholder='e.g., AAPL, MSFT', key='ticker_input', label_visibility='collapsed')
     country_code = st.selectbox('Market Region', ['US','IN','GB','DE','FR','CA','JP'], index=0)
     
     st.markdown("#### Settings")
     use_usd = st.checkbox("Convert to USD", value=False)
     
     st.markdown('---')
-    # REPLACED: use_container_width=True is deprecated for buttons too? No, mostly dataframe/charts.
-    # But for safety and consistency we'll stick to use_container_width which is fine for buttons in current versions
-    # or remove it if problematic. Sticking to use_container_width as it is valid for buttons.
     run_btn = st.button('▶ Generate Research Report', type='primary', use_container_width=True)
     
     if st.session_state.get('analysis_done', False):
@@ -551,9 +555,13 @@ with st.sidebar:
             summ = st.session_state['summary']
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                # Sheet 1: Summary
                 pd.DataFrame([summ]).drop(columns=['fetched_info', 'yf_object'], errors='ignore').astype(str).to_excel(writer, sheet_name='Summary', index=False)
                 
+                # Re-create yf object for export (since we can't pickle it easily)
                 yf_obj_export = yf.Ticker(summ['ticker_used'])
+
+                # Sheet 2-4: Financials
                 if not yf_obj_export.financials.empty: 
                     clean_financial_df(yf_obj_export.financials).to_excel(writer, sheet_name='Income_Statement')
                 if not yf_obj_export.balance_sheet.empty: 
@@ -561,6 +569,7 @@ with st.sidebar:
                 if not yf_obj_export.cashflow.empty: 
                     clean_financial_df(yf_obj_export.cashflow).to_excel(writer, sheet_name='Cash_Flow')
                 
+                # Auto-adjust column widths
                 for sheet in writer.sheets.values():
                     for column in sheet.columns:
                         max_length = 0
@@ -576,6 +585,7 @@ with st.sidebar:
             output.seek(0)
             st.download_button('📥 Download Excel Report', data=output, file_name=f"{summ['ticker_used']}_full_report.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
         except Exception as e:
+            # st.warning(f"Export error: {e}")
             st.warning("Export requires 'openpyxl'. Please install it.")
 
     st.markdown("---")
@@ -588,15 +598,10 @@ with st.sidebar:
 # --- APP LOGIC ---
 
 if run_btn:
-    clean_ticker = ticker_input.strip().upper()
-    if clean_ticker in TICKER_CORRECTIONS:
-        original = clean_ticker
-        clean_ticker = TICKER_CORRECTIONS[clean_ticker]
-        st.toast(f"ℹ️ Auto-corrected '{original}' to '{clean_ticker}'")
-    
-    with st.spinner(f"📊 Analyzing {clean_ticker}..."):
-        summary = run_playbook_for_ticker(clean_ticker, country_code)
+    with st.spinner(f"📊 Analyzing {ticker_input}..."):
+        summary = run_playbook_for_ticker(ticker_input, country_code)
         if summary:
+            # Handle currency conversion rate once
             rate = 1.0
             if use_usd and summary['price_currency'] != 'USD':
                 rate = get_currency_rate(summary['price_currency'], 'USD')
@@ -614,9 +619,12 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
     rate = st.session_state.get('usd_rate', 1.0)
     using_usd = st.session_state.get('use_usd', False)
 
+    # Re-instantiate yf object locally for UI elements that need it
     yf_obj = yf.Ticker(summary['ticker_used'])
+    # Inject it back into summary wrapper for consistency in helper calls
     summary['yf_object'] = yf_obj 
 
+    # Apply conversion for metrics display
     disp_price = summary['price'] * rate if using_usd and summary['price'] else summary['price']
     disp_mcap = summary['marketCap'] * rate if using_usd and summary['marketCap'] else summary['marketCap']
     disp_ccy = "USD" if using_usd else summary['price_currency']
@@ -636,6 +644,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
 
     st.markdown('')
     
+    # --- TABS ---
     tab1, tab2, tab3, tab4 = st.tabs(["📊 Visual Report", "📈 Interactive Chart", "📋 Fundamental Analysis", "⚖️ Peer Comparison"])
     
     with tab1:
@@ -647,7 +656,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             img = io.BytesIO()
             fig.savefig(img, format='png', bbox_inches='tight', dpi=150)
             img.seek(0)
-            plt.close(fig)
+            plt.close(fig) # MEMORY FIX: Close figure
             st.markdown('<hr>', unsafe_allow_html=True)
             col_d1, col_d2, col_d3 = st.columns([1,1.5,1])
             with col_d2:
@@ -677,14 +686,17 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 row_heights = [0.7, 0.3]
                 fig_plotly = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=row_heights, subplot_titles=(f"{summary['ticker_used']} Price", oscillator))
 
+                # Price Candle
                 fig_plotly.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name='Price'), row=1, col=1)
 
+                # Overlays
                 if "SMA 50" in indicators: fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA50'], line=dict(color='orange', width=1.5), name='SMA 50'), row=1, col=1)
                 if "SMA 200" in indicators: fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA200'], line=dict(color='blue', width=1.5), name='SMA 200'), row=1, col=1)
                 if "Bollinger Bands" in indicators:
                     fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Upper'], line=dict(color='gray', width=1, dash='dot'), showlegend=False), row=1, col=1)
                     fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Lower'], line=dict(color='gray', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(128,128,128,0.1)', name='BB'), row=1, col=1)
 
+                # Oscillators
                 if oscillator == "Volume":
                     fig_plotly.add_trace(go.Bar(x=hist.index, y=hist['Volume'], marker_color='teal', name='Volume'), row=2, col=1)
                 elif oscillator == "RSI":
@@ -699,7 +711,6 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     fig_plotly.add_trace(go.Bar(x=hist.index, y=hist_macd, marker_color='gray', name='Hist'), row=2, col=1)
 
                 fig_plotly.update_layout(template='plotly_dark', height=700, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=30, b=0))
-                # REPLACED: use_container_width=True with key argument for proper container fitting in new Streamlit versions
                 st.plotly_chart(fig_plotly, use_container_width=True)
             else:
                 st.warning("No price history available.")
@@ -722,57 +733,64 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 st.table(pd.DataFrame({
                     "Metric": ["Sector", "Industry", "Employees", "Website"],
                     "Value": [info.get('sector', 'N/A'), info.get('industry', 'N/A'), info.get('fullTimeEmployees', 'N/A'), info.get('website', 'N/A')]
-                }).astype(str))
+                }))
 
         with subtab_fin:
             st.markdown("#### Financial Statements (Annual)")
             fin_type = st.selectbox("Select Statement", ["Income Statement", "Balance Sheet", "Cash Flow"])
             try:
-                # REPLACED: use_container_width=True with width argument for dataframes
                 if fin_type == "Income Statement": 
-                    st.dataframe(clean_financial_df(yf_obj.financials), width=None) # Default responsive
+                    st.dataframe(clean_financial_df(yf_obj.financials), use_container_width=True)
                 elif fin_type == "Balance Sheet": 
-                    st.dataframe(clean_financial_df(yf_obj.balance_sheet), width=None)
+                    st.dataframe(clean_financial_df(yf_obj.balance_sheet), use_container_width=True)
                 elif fin_type == "Cash Flow": 
-                    st.dataframe(clean_financial_df(yf_obj.cashflow), width=None)
+                    st.dataframe(clean_financial_df(yf_obj.cashflow), use_container_width=True)
             except: st.warning("Financial data unavailable.")
 
         with subtab_rec:
             st.markdown("#### Analyst Consensus")
             
+            # 1. Fetch Recommendation Mean (Score 1.0 - 5.0)
             rec_mean = info.get('recommendationMean')
-            rec_key = info.get('recommendationKey', '').replace('_', ' ').title() 
+            rec_key = info.get('recommendationKey', '').replace('_', ' ').title() # e.g., "Strong Buy"
             
             if rec_mean:
                 col_gauge, col_text = st.columns([2, 1])
+                
                 with col_gauge:
-                    # Logic: Yahoo 1=Strong Buy, 5=Strong Sell
-                    # Reversal: 6 - score makes 5=Strong Buy (Right side)
+                    # LOGIC INVERSION: 
+                    # Standard Yahoo: 1 = Strong Buy (Left), 5 = Strong Sell (Right)
+                    # Your Request:   Sell on Left, Buy on Right.
+                    # Math: New_Value = 6 - Old_Value (e.g., Old 1 becomes 5)
                     plot_value = 6 - rec_mean
 
+                    # Create Speedometer
                     fig_gauge = go.Figure(go.Indicator(
                         mode = "gauge+number",
                         value = plot_value, 
                         domain = {'x': [0, 1], 'y': [0, 1]},
                         title = {'text': f"Consensus: {rec_key}", 'font': {'size': 24, 'color': '#AEE7B1'}},
+                        # Display the ORIGINAL score (1-5) in the center, or remove standard number if confusing
                         number = {'font': {'size': 40, 'color': 'white'}, 'suffix': " Score"}, 
                         gauge = {
                             'axis': {
                                 'range': [1, 5], 
                                 'tickwidth': 1, 
                                 'tickcolor': "white", 
+                                # LABELS REVERSED: Sell on Left (1), Buy on Right (5)
                                 'ticktext': ['Strong Sell', 'Sell', 'Hold', 'Buy', 'Strong Buy'], 
                                 'tickvals': [1, 2, 3, 4, 5]
                             },
-                            'bar': {'color': "white", 'thickness': 0.02}, 
+                            'bar': {'color': "white", 'thickness': 0.02}, # Thin needle
                             'bgcolor': "rgba(0,0,0,0)",
                             'borderwidth': 0,
+                            # COLORS REVERSED: Red on Left, Green on Right
                             'steps': [
-                                {'range': [1, 1.8], 'color': "#FF0000"},    
-                                {'range': [1.8, 2.6], 'color': "#FF8C00"},  
-                                {'range': [2.6, 3.4], 'color': "#FFD700"},  
-                                {'range': [3.4, 4.2], 'color': "#88E338"},  
-                                {'range': [4.2, 5], 'color': "#00C805"}     
+                                {'range': [1, 1.8], 'color': "#FF0000"},    # Strong Sell (Red)
+                                {'range': [1.8, 2.6], 'color': "#FF8C00"},  # Sell (Orange)
+                                {'range': [2.6, 3.4], 'color': "#FFD700"},  # Hold (Yellow)
+                                {'range': [3.4, 4.2], 'color': "#88E338"},  # Buy (Light Green)
+                                {'range': [4.2, 5], 'color': "#00C805"}     # Strong Buy (Green)
                             ],
                             'threshold': {
                                 'line': {'color': "white", 'width': 4},
@@ -781,13 +799,13 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                             }
                         }
                     ))
+                    # MARGIN FIX: Increased 't' (top) from 40 to 80 to prevent title cutoff
                     fig_gauge.update_layout(
                         paper_bgcolor = "rgba(0,0,0,0)", 
                         font = {'color': "white", 'family': "Inter"}, 
                         height=350, 
                         margin=dict(l=30, r=30, t=80, b=20) 
                     )
-                    # REPLACED: use_container_width=True for chart
                     st.plotly_chart(fig_gauge, use_container_width=True)
 
                 with col_text:
@@ -805,6 +823,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             else:
                 st.info("No sufficient analyst data to generate a gauge.")
 
+            # 2. Price Target Metric
             target = info.get('targetMeanPrice')
             current = info.get('regularMarketPrice')
             if target and current:
@@ -813,71 +832,40 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 st.metric("Mean Analyst Price Target", human_readable_price(target, summary['price_currency']), f"{delta:.2f}% Upside")
 
         with subtab_news:
-            # FIXED NEWS SECTION with robust key checks
-            news_items = []
-            
+            valid_news_count = 0
             try:
                 yf_news = yf_obj.news
-                if yf_news:
-                    for item in yf_news:
+                if yf_news and isinstance(yf_news, list):
+                    for item in yf_news[:5]:
+                        if not isinstance(item, dict): continue
                         title = item.get('title')
-                        link = item.get('link')
-                        if not title or not link:
-                            continue
-                        
+                        if not title: continue
+                        link = item.get('link', '#')
                         publisher = item.get('publisher', 'Yahoo Finance')
-                        pub_time = item.get('providerPublishTime')
-                        
-                        if pub_time:
-                            pub_date_str = datetime.fromtimestamp(pub_time).strftime('%Y-%m-%d')
-                        else:
-                            pub_date_str = "Recent"
-                            
-                        news_items.append({
-                            'title': title,
-                            'link': link,
-                            'publisher': publisher,
-                            'date': pub_date_str,
-                            'source': 'Yahoo'
-                        })
-            except Exception:
-                pass
+                        pub_time_raw = item.get('providerPublishTime')
+                        pub_time_str = datetime.fromtimestamp(pub_time_raw).strftime('%Y-%m-%d') if pub_time_raw else "Recent"
+                        st.markdown(f"""<div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #2D7A3E;"><a href="{link}" target="_blank" style="color: #AEE7B1; font-weight: bold; text-decoration: none;">{title}</a><div style="color: #888; font-size: 12px;">{pub_time_str} • {publisher}</div></div>""", unsafe_allow_html=True)
+                        valid_news_count += 1
+            except: pass
             
-            if not news_items:
-                news_items = fetch_news_fallback(summary['ticker_used'])
-            
-            if news_items:
-                for item in news_items[:10]:
-                    safe_title = html.escape(item.get('title', ''))
-                    safe_pub = html.escape(item.get('publisher', 'Unknown'))
-                    link = item.get('link', '#')
-                    date_str = item.get('date') or item.get('providerPublishTime') or "Recent"
-                    
-                    border_color = "#2D7A3E" if item.get('source') == 'Yahoo' else "#F59E0B"
-                    link_color = "#AEE7B1" if item.get('source') == 'Yahoo' else "#FCD34D"
-                    
-                    st.markdown(f"""
-                    <div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid {border_color};">
-                        <a href="{link}" target="_blank" style="color: {link_color}; font-weight: bold; text-decoration: none; font-size: 16px;">
-                            {safe_title}
-                        </a>
-                        <div style="color: #aaa; font-size: 12px; margin-top: 4px;">
-                            {date_str} • {safe_pub}
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-            else:
-                st.info("No recent news found for this ticker.")
+            if valid_news_count == 0:
+                fallback_news = fetch_news_fallback(summary['ticker_used'])
+                if fallback_news:
+                    for item in fallback_news:
+                        st.markdown(f"""<div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #F59E0B;"><a href="{item['link']}" target="_blank" style="color: #FCD34D; font-weight: bold; text-decoration: none;">{item['title']}</a><div style="color: #888; font-size: 12px;">{item['providerPublishTime']} • {item['publisher']}</div></div>""", unsafe_allow_html=True)
+                else: st.info("No news found.")
 
     with tab4:
         st.markdown('<h3 style="color:#1B4D2B;">Peer Comparison</h3>', unsafe_allow_html=True)
         peer_input = st.text_input("Enter Peer Tickers (comma separated)", placeholder="e.g. MSFT, GOOGL, META")
         compare_btn = st.button("Compare Peers")
         
+        # --- NEW PARALLELIZED LOGIC ---
         if compare_btn and peer_input:
             peers = [x.strip().upper() for x in peer_input.split(',') if x.strip()]
             peers.insert(0, summary['ticker_used']) 
             
+            # Function to run in parallel
             def fetch_peer_data(p_ticker):
                 try:
                     p_obj = yf.Ticker(p_ticker)
@@ -899,18 +887,21 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             
             comparison_data = []
             with st.spinner(f"Fetching data for {len(peers)} tickers..."):
+                # Use ThreadPoolExecutor to run fetch_peer_data for all tickers at once
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     results = list(executor.map(fetch_peer_data, peers))
+                
+                # Filter out failures
                 comparison_data = [r for r in results if r is not None]
 
             if comparison_data:
                 comp_df = pd.DataFrame(comparison_data).set_index("Ticker").transpose()
-                # REPLACED: use_container_width=True with width argument
-                st.dataframe(comp_df, width=None)
+                st.dataframe(comp_df, use_container_width=True)
             else:
                 st.warning("No data found for peers.")
 
 else:
+    # Landing
     col_land_1, col_land_2 = st.columns([1.6,1], gap='large')
     with col_land_1:
         st.markdown('''
