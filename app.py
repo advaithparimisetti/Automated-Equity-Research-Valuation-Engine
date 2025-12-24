@@ -6,19 +6,26 @@ import requests
 from bs4 import BeautifulSoup
 from datetime import datetime
 import traceback
-import matplotlib.pyplot as plt
+# THREAD SAFETY FIX: Import Figure directly
+from matplotlib.figure import Figure 
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 import matplotlib.patches as patches
 from matplotlib.gridspec import GridSpec
 import seaborn as sns
 import io
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
-import concurrent.futures  # NEW: For parallel processing
+import concurrent.futures
 
-# Optional PDF export support
+# PDF Report Generation Imports
 try:
     from reportlab.lib.pagesizes import letter
     from reportlab.pdfgen import canvas
+    from reportlab.lib.utils import ImageReader
+    from reportlab.lib import colors
+    from reportlab.platypus import Table, TableStyle, Paragraph
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.enums import TA_JUSTIFY, TA_LEFT
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
@@ -29,21 +36,19 @@ except Exception:
 
 sns.set_style("whitegrid")
 
+# SECTOR BENCHMARKS FOR VALUATION
+SECTOR_PE_MAP = {
+    "Technology": 25, "Financial Services": 12, "Healthcare": 20,
+    "Consumer Cyclical": 18, "Industrials": 18, "Energy": 10,
+    "Utilities": 15, "Real Estate": 35, "Basic Materials": 15,
+    "Communication Services": 20
+}
+
 COUNTRY_SUFFIX_MAP = {
-    "IN": [".NS", ".BO"],
-    "US": [""],
-    "GB": [".L"],
-    "DE": [".DE"],
-    "FR": [".PA"],
-    "CA": [".TO"],
-    "AU": [".AX"],
-    "HK": [".HK"],
-    "JP": [".T"],
-    "SG": [".SI"],
-    "CH": [".SW"],
-    "NL": [".AS"],
-    "SE": [".ST"],
-    "IT": [".MI"],
+    "IN": [".NS", ".BO"], "US": [""], "GB": [".L"], "DE": [".DE"],
+    "FR": [".PA"], "CA": [".TO"], "AU": [".AX"], "HK": [".HK"],
+    "JP": [".T"], "SG": [".SI"], "CH": [".SW"], "NL": [".AS"],
+    "SE": [".ST"], "IT": [".MI"],
 }
 
 _CURRENCY_SYMBOLS = {
@@ -56,8 +61,8 @@ def _get_currency_symbol(currency_code):
     if not currency_code: return ""
     return _CURRENCY_SYMBOLS.get(currency_code.upper(), currency_code.upper() + " ")
 
-# CACHED: Currency rates don't change every second
-@st.cache_data(ttl=3600)
+# CACHED: Currency rates
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_currency_rate(from_currency, to_currency="USD"):
     if not from_currency or from_currency.upper() == to_currency.upper():
         return 1.0
@@ -71,6 +76,18 @@ def get_currency_rate(from_currency, to_currency="USD"):
         pass
     return 1.0
 
+# CACHED: Risk Free Rate
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_risk_free_rate():
+    try:
+        tnx = yf.Ticker("^TNX")
+        hist = tnx.history(period="1d")
+        if not hist.empty:
+            return hist['Close'].iloc[-1] / 100.0
+    except:
+        pass
+    return 0.04 
+
 def format_large_number(n):
     if n is None: return "N/A"
     try:
@@ -83,31 +100,14 @@ def format_large_number(n):
     except: return str(n)
 
 def clean_financial_df(df):
-    """Beautifies financial dataframes: transpose, format numbers, fix headers"""
     if df is None or df.empty:
         return pd.DataFrame()
-    
-    # Transpose so Metrics are Rows and Dates are Columns
     df_T = df.transpose()
-    
-    # Sort columns (dates) descending (newest first)
     df_T = df_T[sorted(df_T.columns, reverse=True)]
-    
-    # Format the dates in columns to simply YYYY-MM-DD
     df_T.columns = [d.strftime('%Y-%m-%d') if isinstance(d, datetime) else str(d) for d in df_T.columns]
-    
-    # Format the numeric values
     for col in df_T.columns:
         df_T[col] = df_T[col].apply(lambda x: format_large_number(x) if isinstance(x, (int, float)) else x)
-        
     return df_T
-
-def human_readable_inr(value):
-    if value is None: return "n/a"
-    try:
-        cr = value / 1e7
-        return f"₹{cr:,.2f} Cr"
-    except Exception: return str(value)
 
 def human_readable_generic(value, currency_code=None):
     if value is None: return "n/a"
@@ -125,10 +125,12 @@ def human_readable_marketcap(value, currency_code=None):
     if value is None: return "n/a"
     currency = (currency_code or "").upper()
     if currency in ("INR", "₹"):
-        local_str = human_readable_inr(value)
+        try:
+            cr = value / 1e7
+            return f"₹{cr:,.2f} Cr"
+        except: return str(value)
     else:
-        local_str = human_readable_generic(value, currency)
-    return local_str
+        return human_readable_generic(value, currency)
 
 def human_readable_price(price, currency_code=None):
     if price is None: return "n/a"
@@ -166,8 +168,7 @@ def get_yf_ticker_variants(base_ticker, country_code):
             out.append(v); seen.add(v)
     return out
 
-# CACHED: Fetching ticker info is the most expensive operation
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_info_with_variants(base_ticker, country_code):
     tried = []
     variants = get_yf_ticker_variants(base_ticker, country_code)
@@ -175,7 +176,6 @@ def fetch_info_with_variants(base_ticker, country_code):
         try:
             t = yf.Ticker(variant)
             info = t.info
-            # Validation: ensure we got meaningful data
             if info and (info.get("regularMarketPrice") is not None or info.get("symbol") or info.get("shortName")):
                 return info, variant
         except Exception:
@@ -200,33 +200,157 @@ def fetch_screener_in(ticker_base):
     except: return {}
 
 def fetch_news_fallback(ticker):
+    # Improved fallback using robust Google News RSS parsing
     news_items = []
     try:
-        query = f"{ticker} stock news"
+        # Clean ticker for search (remove suffixes for better news results)
+        search_ticker = ticker.split('.')[0]
+        query = f"{search_ticker} stock finance"
         url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
-        r = requests.get(url, headers=headers, timeout=6)
+        
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+        
+        r = requests.get(url, headers=headers, timeout=5)
         soup = BeautifulSoup(r.content, features="xml")
         items = soup.findAll('item')
+        
         for item in items[:5]: 
             try:
-                title = item.title.text
-                link = item.link.text
-                pub_date = item.pubDate.text
-                try:
-                    dt = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %Z")
-                    date_str = dt.strftime("%Y-%m-%d")
-                except:
-                    date_str = "Recent"
-                news_items.append({'title': title, 'link': link, 'publisher': 'Google News', 'providerPublishTime': date_str})
+                title = item.title.text if item.title else "No Title"
+                link = item.link.text if item.link else "#"
+                pub_date = item.pubDate.text if item.pubDate else ""
+                
+                # Format date
+                date_str = "Recent"
+                if pub_date:
+                    try:
+                        dt = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %Z")
+                        date_str = dt.strftime("%Y-%m-%d")
+                    except:
+                        pass
+                
+                # Deduplication check
+                if any(x['link'] == link for x in news_items):
+                    continue
+                    
+                news_items.append({
+                    'title': title, 
+                    'link': link, 
+                    'publisher': 'Google News', 
+                    'providerPublishTime': date_str
+                })
             except: continue
-    except Exception: pass
+    except Exception: 
+        pass
     return news_items
+
+# --- FINANCIAL MODELING HELPERS ---
+def calculate_wacc_auto(info, financials, balance_sheet):
+    try:
+        rf = get_risk_free_rate()
+        beta = info.get('beta')
+        if beta is None: beta = 1.0
+        market_prem = 0.055 
+        cost_equity = rf + beta * market_prem
+        
+        interest_expense = 0
+        total_debt = 0
+        
+        if not financials.empty:
+            if 'Interest Expense' in financials.index:
+                interest_expense = abs(financials.loc['Interest Expense'].iloc[0])
+            elif 'Interest Expense Non Operating' in financials.index:
+                interest_expense = abs(financials.loc['Interest Expense Non Operating'].iloc[0])
+                
+        if not balance_sheet.empty:
+            if 'Total Debt' in balance_sheet.index:
+                total_debt = balance_sheet.loc['Total Debt'].iloc[0]
+        
+        tax_rate = 0.21 
+        if not financials.empty and 'Tax Provision' in financials.index and 'Pretax Income' in financials.index:
+            try:
+                taxes = financials.loc['Tax Provision'].iloc[0]
+                pretax = financials.loc['Pretax Income'].iloc[0]
+                if pretax != 0:
+                    calc_tax = taxes / pretax
+                    if 0 < calc_tax < 0.5: 
+                        tax_rate = calc_tax
+            except: pass
+
+        if total_debt > 0 and interest_expense > 0:
+            cost_debt = (interest_expense / total_debt)
+        else:
+            cost_debt = rf + 0.02 
+            
+        cost_debt_after_tax = cost_debt * (1 - tax_rate)
+        
+        market_cap = info.get('marketCap', 0)
+        if market_cap is None or market_cap == 0:
+            raise ValueError("No Market Cap")
+            
+        total_val = market_cap + total_debt
+        w_e = market_cap / total_val
+        w_d = total_debt / total_val
+        
+        wacc = (w_e * cost_equity) + (w_d * cost_debt_after_tax)
+        
+        details = {
+            "Risk Free Rate": rf,
+            "Beta": beta,
+            "Cost of Equity": cost_equity,
+            "Cost of Debt (Pre-Tax)": cost_debt,
+            "WACC": wacc
+        }
+        return wacc, details
+    except:
+        fallback_details = {
+            "Risk Free Rate": 0.04,
+            "Beta": 1.0,
+            "Cost of Equity": 0.10,
+            "Cost of Debt (Pre-Tax)": 0.05,
+            "WACC": 0.10
+        }
+        return 0.10, fallback_details
+
+def calculate_auto_growth(info):
+    try:
+        roe = info.get('returnOnEquity', 0.10)
+        if roe is None: roe = 0.10
+        payout = info.get('payoutRatio', 0.0)
+        if payout is None: payout = 0.0
+        retention = 1 - payout
+        growth = roe * retention
+        growth = max(0.02, min(growth, 0.20)) 
+        return growth
+    except:
+        return 0.05
+
+# --- RISK METRICS ---
+def calculate_beta(stock_hist, market_hist):
+    stock_returns = stock_hist['Close'].pct_change().dropna()
+    market_returns = market_hist['Close'].pct_change().dropna()
+    common_dates = stock_returns.index.intersection(market_returns.index)
+    stock_returns = stock_returns.loc[common_dates]
+    market_returns = market_returns.loc[common_dates]
+    if len(stock_returns) < 30: return None
+    covariance = np.cov(stock_returns, market_returns)[0][1]
+    variance = np.var(market_returns)
+    return covariance / variance
+
+def calculate_var(stock_hist, confidence_level=0.95):
+    returns = stock_hist['Close'].pct_change().dropna()
+    if returns.empty: return None
+    return np.percentile(returns, (1 - confidence_level) * 100)
 
 # --- SCORING LOGIC ---
 def score_undervalued_from_info(info):
     score = 0
     details = {}
+    sector = info.get("sector", "Unknown")
+    pe_benchmark = SECTOR_PE_MAP.get(sector, 20)
+
     pe = safe_numeric(info.get("trailingPE"))
     pb = safe_numeric(info.get("priceToBook"))
     roe = safe_numeric(info.get("returnOnEquity"))
@@ -234,11 +358,12 @@ def score_undervalued_from_info(info):
     dte = safe_numeric(info.get("debtToEquity"))
     rev_growth = safe_numeric(info.get("revenueGrowth"))
     div_yield = safe_numeric(info.get("dividendYield"))
-    details.update({"pe": pe, "pb": pb, "roe": roe, "roic": roic, "debtToEquity": dte, "revenueGrowth": rev_growth, "dividendYield": div_yield})
+    
+    details.update({"pe": pe, "pb": pb, "roe": roe, "roic": roic, "debtToEquity": dte, "revenueGrowth": rev_growth, "dividendYield": div_yield, "sector_pe_benchmark": pe_benchmark})
 
     if pe and pe > 0:
-        if pe < 15: score += 8
-        elif pe < 25: score += 4
+        if pe < (pe_benchmark * 0.6): score += 8
+        elif pe < (pe_benchmark * 0.9): score += 4
     if pb and pb > 0:
         if pb < 1.5: score += 6
         elif pb < 3: score += 3
@@ -284,18 +409,14 @@ def score_multibagger_from_info(info):
     if opm is not None and opm > 0.15: score += 3
     return score, details
 
-# CACHED: Main entry point for analysis
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600, show_spinner=False)
 def run_playbook_for_ticker(ticker_input, country_code=""):
     try:
-        # fetch_info_with_variants is cached, so we just get dict/str
         info, used_variant = fetch_info_with_variants(ticker_input, country_code)
     except Exception as e:
         return None
 
-    # Re-instantiate Ticker object here (cheap operation) for access to history/financials later
     yf_obj = yf.Ticker(used_variant)
-
     screener_facts = {}
     if country_code and country_code.upper() == "IN":
         screener_facts = fetch_screener_in(ticker_input)
@@ -306,8 +427,6 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
     summary = {
         "ticker_requested": ticker_input,
         "ticker_used": used_variant,
-        # Note: We cannot cache the yf_object itself easily in st.cache_data, 
-        # so we store the info dict and re-create the object when needed.
         "company": info.get("shortName") or info.get("longName") or used_variant,
         "price": safe_numeric(info.get("regularMarketPrice")),
         "price_currency": info.get("currency"),
@@ -324,6 +443,265 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
     }
     return summary
 
+# --- PDF GENERATOR (COMPLETE & INTERPRETABLE) ---
+def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fig, dcf_charts):
+    buffer = io.BytesIO()
+    c = canvas.Canvas(buffer, pagesize=letter)
+    width, height = letter
+    
+    # STYLES
+    styles = getSampleStyleSheet()
+    styleN = styles['Normal']
+    styleH = styles['Heading2']
+    styleN.fontSize = 10
+    styleN.leading = 14
+    
+    # --- HELPER: DRAW WATERMARK ---
+    def draw_watermark(c):
+        c.saveState()
+        c.setFont("Helvetica-Bold", 60)
+        c.setFillColorRGB(0.9, 0.9, 0.9) 
+        c.setFillAlpha(0.3) 
+        c.translate(width/2, height/2)
+        c.rotate(45)
+        c.drawCentredString(0, 0, "Sai Advaith Parimisetti")
+        c.restoreState()
+
+    # --- HELPER: DRAW FOOTER ---
+    def draw_footer(c):
+        c.saveState()
+        c.setFont("Helvetica", 8)
+        c.setFillColor(colors.grey)
+        c.drawCentredString(width/2, 20, "EDUCATIONAL PURPOSE ONLY. NOT FINANCIAL ADVICE. DATA GENERATED ALGORITHMICALLY.")
+        c.restoreState()
+
+    # --- HELPER: DRAW HEADER STRIP ---
+    def draw_header_strip(c, title):
+        c.setFillColorRGB(0.05, 0.2, 0.4) # Navy Blue
+        c.rect(0, height-60, width, 60, fill=1, stroke=0)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 24)
+        c.drawString(30, height-40, title)
+        c.setFont("Helvetica", 12)
+        c.drawString(width-200, height-40, f"{summary['ticker_used']} | {datetime.now().strftime('%Y-%m-%d')}")
+
+    # --- HELPER: DRAW INSIGHT TEXT BOX ---
+    def draw_insight_box(c, x, y, w, h, title, text):
+        # Draw Box
+        c.setStrokeColor(colors.lightgrey)
+        c.setFillColor(colors.whitesmoke)
+        c.rect(x, y, w, h, fill=1)
+        # Draw Title
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(x+10, y+h-15, title)
+        # Draw Text
+        p = Paragraph(text, styleN)
+        p.wrapOn(c, w-20, h-30)
+        p.drawOn(c, x+10, y+h-25-p.height)
+
+    # ---------------------------------------------------------
+    # PAGE 1: EXECUTIVE SUMMARY
+    # ---------------------------------------------------------
+    draw_watermark(c)
+    draw_header_strip(c, f"Equity Research: {summary['company']}")
+    
+    # 1. Main Infographic
+    if visual_fig:
+        img_buffer = io.BytesIO()
+        visual_fig.savefig(img_buffer, format='png', bbox_inches='tight', dpi=120)
+        img_buffer.seek(0)
+        img = ImageReader(img_buffer)
+        c.drawImage(img, 30, height - 500, width=550, height=420, preserveAspectRatio=True)
+    
+    # 2. Key Metrics Strip
+    y_metrics = height - 530
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(30, y_metrics, "Key Fundamental Metrics")
+    
+    # Prepare Data for Table
+    details = summary['undervalued_details']
+    m_details = summary['multibagger_details']
+    
+    metrics_data = [
+        ["Metric", "Value", "Metric", "Value"],
+        ["Undervalued Score", f"{summary['undervalued_score']}/40", "Growth Score", f"{summary['multibagger_score']}/50"],
+        ["P/E Ratio", f"{details.get('pe', 'N/A')}", "ROE", f"{fmt_pct_val(details.get('roe'))}"],
+        ["Sector Avg P/E", f"{details.get('sector_pe_benchmark', 'N/A')}", "Revenue Growth", f"{fmt_pct_val(details.get('revenueGrowth'))}"],
+        ["Debt/Equity", f"{details.get('debtToEquity', 'N/A')}", "Gross Margin", f"{fmt_pct_val(m_details.get('grossMargins'))}"]
+    ]
+    
+    t_metrics = Table(metrics_data, colWidths=[130, 130, 130, 130])
+    t_metrics.setStyle(TableStyle([
+        ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0E1117')),
+        ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+        ('ALIGN', (0,0), (-1,-1), 'CENTER'),
+        ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+        ('BOTTOMPADDING', (0,0), (-1,0), 8),
+        ('GRID', (0,0), (-1,-1), 0.5, colors.lightgrey),
+        ('BACKGROUND', (0,1), (-1,-1), colors.white),
+    ]))
+    t_metrics.wrapOn(c, width, height)
+    t_metrics.drawOn(c, 40, y_metrics - 120)
+
+    # 3. Analyst Verdict (Auto-Generated)
+    verdict = "Undervalued" if summary['undervalued_score'] > 25 else "Fair Value/Overvalued"
+    verdict_text = f"Based on the algorithmic scoring, {summary['company']} is currently rated as <b>{verdict}</b> relative to its historicals and sector peers. The company has a Fundamental Score of {summary['undervalued_score']}/40."
+    
+    draw_insight_box(c, 40, y_metrics - 220, 530, 80, "Algorithmic Verdict", verdict_text)
+
+    draw_footer(c)
+    c.showPage()
+    
+    # ---------------------------------------------------------
+    # PAGE 2: VALUATION DEEP DIVE (CHARTS & INSIGHTS)
+    # ---------------------------------------------------------
+    draw_watermark(c)
+    draw_header_strip(c, "Deep Dive Valuation Analysis")
+    
+    current_y = height - 100
+    
+    # A. WATERFALL CHART
+    if dcf_charts and 'waterfall' in dcf_charts:
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(30, current_y, "1. Valuation Bridge (Source of Value)")
+        current_y -= 220
+        
+        # Draw Chart
+        w_data = dcf_charts['waterfall']
+        fig_w = Figure(figsize=(6, 3), dpi=100)
+        ax_w = fig_w.subplots()
+        vals = w_data['values']
+        labels = w_data['labels']
+        bottoms = [0, vals[0], 0]
+        ax_w.bar(labels, vals, bottom=bottoms, color=['#2b7fc1', '#d93f3f', '#2ea043'])
+        ax_w.set_ylabel("Value")
+        ax_w.grid(axis='y', alpha=0.3)
+        
+        img_buf = io.BytesIO()
+        fig_w.savefig(img_buf, format='png', bbox_inches='tight')
+        img_buf.seek(0)
+        c.drawImage(ImageReader(img_buf), 30, current_y, width=350, height=175, preserveAspectRatio=True)
+        
+        # Draw Insight
+        term_pct = (vals[1] / vals[2]) * 100 if vals[2] > 0 else 0
+        insight_text = f"This chart breaks down the Intrinsic Value. Notice that <b>{term_pct:.1f}%</b> of the value comes from the Terminal Value (years 5+). This indicates the valuation is highly dependent on long-term stability rather than short-term cash flows."
+        draw_insight_box(c, 400, current_y + 20, 180, 140, "Analyst Commentary", insight_text)
+        
+        current_y -= 50
+
+    # B. SENSITIVITY HEATMAP
+    if dcf_charts and 'sensitivity' in dcf_charts:
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(30, current_y, "2. Sensitivity Analysis (WACC vs Growth)")
+        current_y -= 220
+        
+        # Draw Chart
+        s_data = dcf_charts['sensitivity']
+        df_sens = s_data['matrix']
+        fig_h = Figure(figsize=(6, 3), dpi=100)
+        ax_h = fig_h.subplots()
+        sns.heatmap(df_sens, annot=True, fmt=".0f", cmap="RdYlGn", ax=ax_h, cbar=False)
+        ax_h.set_xlabel("Terminal Growth")
+        ax_h.set_ylabel("WACC")
+        
+        img_buf = io.BytesIO()
+        fig_h.savefig(img_buf, format='png', bbox_inches='tight')
+        img_buf.seek(0)
+        c.drawImage(ImageReader(img_buf), 30, current_y, width=350, height=175, preserveAspectRatio=True)
+        
+        # Draw Insight
+        insight_text = "The Heatmap shows the theoretical share price under different economic conditions. Green areas represent optimistic scenarios (Low WACC / High Growth), while Red areas indicate downside risk if interest rates rise or growth slows."
+        draw_insight_box(c, 400, current_y + 20, 180, 140, "Risk Assessment", insight_text)
+        
+        current_y -= 50
+
+    # C. METHODOLOGY COMPARISON
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(30, current_y, "3. Methodology Face-off")
+    
+    if dcf_data:
+        # Create Comparison Chart manually since it wasn't in state
+        # Simplified bar chart
+        fig_c = Figure(figsize=(6, 2), dpi=100)
+        ax_c = fig_c.subplots()
+        methods = ["Perpetual Growth", "Exit Multiple (12x)"]
+        # We need to recalculate Exit Multiple quickly or just visualize placeholders if data missing
+        # For robustness, we will visualize the Intrinsic Value vs Current Price
+        
+        try:
+            curr_price = summary['price']
+            intr_val = float(dcf_data['intrinsic_value'].replace(summary['price_currency'], '').replace(',',''))
+            
+            ax_c.barh(['Current Price', 'Intrinsic Value'], [curr_price, intr_val], color=['grey', '#2ea043'])
+            ax_c.set_xlim(0, max(curr_price, intr_val)*1.2)
+            
+            img_buf = io.BytesIO()
+            fig_c.savefig(img_buf, format='png', bbox_inches='tight')
+            img_buf.seek(0)
+            c.drawImage(ImageReader(img_buf), 30, current_y - 120, width=350, height=100, preserveAspectRatio=True)
+            
+            diff = intr_val - curr_price
+            direction = "Discount" if diff > 0 else "Premium"
+            insight_text = f"The stock is trading at a <b>{abs(diff):.2f} {summary['price_currency']} {direction}</b> to its fair value. A wide gap suggests a potential margin of safety."
+            draw_insight_box(c, 400, current_y - 120, 180, 100, "Price Action", insight_text)
+            
+        except: pass
+
+    draw_footer(c)
+    c.showPage()
+
+    # ---------------------------------------------------------
+    # PAGE 3: RISK REPORT
+    # ---------------------------------------------------------
+    draw_watermark(c)
+    draw_header_strip(c, "Risk Management Profile")
+    
+    # Risk Metrics Table
+    c.setFont("Helvetica-Bold", 14)
+    c.drawString(30, height - 100, "Quantitative Risk Metrics (1 Year)")
+    
+    if risk_data:
+        r_data = [
+            ["Metric", "Value", "Interpretation"],
+            ["Beta", risk_data.get('beta', 'N/A'), "Volatility relative to Market"],
+            ["VaR (95%)", risk_data.get('var', 'N/A'), "Max expected daily loss (95% conf)"],
+            ["Max Drawdown", risk_data.get('drawdown', 'N/A'), "Worst peak-to-trough drop"]
+        ]
+        t2 = Table(r_data, colWidths=[100, 100, 300])
+        t2.setStyle(TableStyle([
+            ('BACKGROUND', (0,0), (-1,0), colors.HexColor('#0E1117')),
+            ('TEXTCOLOR', (0,0), (-1,0), colors.white),
+            ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+            ('FONTNAME', (0,0), (-1,0), 'Helvetica-Bold'),
+            ('BOTTOMPADDING', (0,0), (-1,0), 12),
+            ('GRID', (0,0), (-1,-1), 1, colors.grey)
+        ]))
+        t2.wrapOn(c, width, height)
+        t2.drawOn(c, 30, height - 200)
+        
+        # Risk Histogram
+        c.drawString(30, height - 250, "Return Distribution Histogram")
+        if risk_fig:
+            r_img_buffer = io.BytesIO()
+            risk_fig.savefig(r_img_buffer, format='png', bbox_inches='tight', dpi=120)
+            r_img_buffer.seek(0)
+            c.drawImage(ImageReader(r_img_buffer), 30, height - 550, width=500, height=250, preserveAspectRatio=True)
+            
+            hist_insight = """
+            <b>Interpreting the Histogram:</b><br/>
+            - <b>Fat Tails:</b> If the curve extends far left/right, the stock has high "Tail Risk" (prone to extreme crashes or rallies).<br/>
+            - <b>Peak:</b> A tall, narrow peak indicates stability. A flat, wide curve indicates unpredictability.<br/>
+            - <b>VaR Line:</b> The red line marks the danger zone. Losses beyond this point happen less than 5% of the time.
+            """
+            draw_insight_box(c, 30, height - 680, 500, 100, "Volatility Analysis", hist_insight)
+
+    draw_footer(c)
+    c.showPage()
+    c.save()
+    buffer.seek(0)
+    return buffer
+
 def calculate_rsi(data, window=14):
     delta = data.diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
@@ -339,20 +717,20 @@ def calculate_macd(data, slow=26, fast=12, signal=9):
     hist = macd - sig
     return macd, sig, hist
 
-# --- PLOTTING UTILS (STATIC) ---
+# --- PLOTTING UTILS ---
 def draw_kpi(ax, title, value, subtitle=None, fontsize=12, small=False):
     ax.axis('off')
     ax.add_patch(patches.Rectangle((0, 0), 1, 1, color='white', ec='#e6e6e6', lw=1, zorder=0))
-    ax.text(0.5, 0.65, title, ha='center', va='center', fontsize=12 if not small else 10, color='#333')
-    ax.text(0.5, 0.35, value, ha='center', va='center', fontsize=18 if not small else 14, fontweight='bold', color='#111')
+    ax.text(0.5, 0.65, title, ha='center', va='center', fontsize=12 if not small else 10, color='#333', transform=ax.transAxes)
+    ax.text(0.5, 0.35, value, ha='center', va='center', fontsize=18 if not small else 14, fontweight='bold', color='#111', transform=ax.transAxes)
     if subtitle:
-        ax.text(0.5, 0.12, subtitle, ha='center', va='center', fontsize=9 if not small else 8, color='#666')
+        ax.text(0.5, 0.12, subtitle, ha='center', va='center', fontsize=9 if not small else 8, color='#666', transform=ax.transAxes)
 
 def gauge_bar(ax, pct, label, bgcolor='#f3f3f3'):
     ax.axis('off')
     ax.add_patch(patches.Rectangle((0, 0.25), 1, 0.5, color=bgcolor, zorder=0, ec='none', alpha=1.0))
     pct_clamped = max(0.0, min(1.0, pct))
-    cmap_map = plt.get_cmap('RdYlGn')
+    cmap_map = sns.color_palette("RdYlGn", as_cmap=True)
     color = cmap_map(pct_clamped)
     ax.add_patch(patches.Rectangle((0, 0.25), pct_clamped, 0.5, color=color, zorder=1))
     ax.text(0.01, 0.75, label, ha='left', va='bottom', fontsize=10, color='#333')
@@ -404,8 +782,9 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
     u_details = s.get('undervalued_details', {})
     m_details = s.get('multibagger_details', {})
     
-    fig = plt.figure(constrained_layout=True, figsize=(14,10))
+    fig = Figure(constrained_layout=True, figsize=(14,10))
     gs = GridSpec(6, 6, figure=fig)
+    
     ax_header = fig.add_subplot(gs[0, :4])
     ax_right = fig.add_subplot(gs[0, 4:])
     ax_kpi_1 = fig.add_subplot(gs[1, 0])
@@ -419,22 +798,23 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
     ax_price = fig.add_subplot(gs[5, 0:6])
 
     ax_header.axis('off')
-    ax_header.text(0.01, 0.7, company, fontsize=20, fontweight='bold', color='#111')
-    ax_header.text(0.01, 0.48, f"{ticker_used}   |   Sector: {sector}", fontsize=11, color='#444')
-    ax_header.text(0.01, 0.28, f"Price: {human_readable_price(price, price_ccy)}    MarketCap: {human_readable_marketcap(mcap, mcap_ccy)}", fontsize=11, color='#333')
-    ax_header.text(0.01, 0.08, f"Report generated: {datetime.utcnow().strftime('%Y-%m-%d')} | Analysis by Sai Advaith Parimisetti", fontsize=9, color='#666')
-    ax_header.text(0.01, -0.15, "Disclaimer: For informational purposes only. Not financial advice.", fontsize=7, color='#999', ha='left')
+    ax_header.text(0.01, 0.7, company, fontsize=20, fontweight='bold', color='#111', transform=ax_header.transAxes)
+    ax_header.text(0.01, 0.48, f"{ticker_used}   |   Sector: {sector}", fontsize=11, color='#444', transform=ax_header.transAxes)
+    ax_header.text(0.01, 0.28, f"Price: {human_readable_price(price, price_ccy)}    MarketCap: {human_readable_marketcap(mcap, mcap_ccy)}", fontsize=11, color='#333', transform=ax_header.transAxes)
+    ax_header.text(0.01, 0.08, f"Report generated: {datetime.utcnow().strftime('%Y-%m-%d')} | Analysis by Sai Advaith Parimisetti", fontsize=9, color='#666', transform=ax_header.transAxes)
+    ax_header.text(0.01, -0.15, "Disclaimer: For informational purposes only. Not financial advice.", fontsize=7, color='#999', ha='left', transform=ax_header.transAxes)
 
     ax_right.axis('off')
     ax_right.add_patch(patches.Rectangle((0.02, 0.12), 0.96, 0.76, color='#fafafa', ec='#e6e6e6'))
-    ax_right.text(0.5, 0.78, "Core Snapshot", ha='center', fontsize=11, fontweight='bold')
-    ax_right.text(0.07, 0.62, f"P/E: {u_details.get('pe') if u_details.get('pe') else 'n/a'}", fontsize=10)
-    ax_right.text(0.07, 0.50, f"P/B: {u_details.get('pb') if u_details.get('pb') else 'n/a'}", fontsize=10)
-    ax_right.text(0.07, 0.38, f"ROE: {fmt_pct_val(u_details.get('roe'))}", fontsize=10)
-    ax_right.text(0.07, 0.26, f"Rev Growth: {fmt_pct_val(u_details.get('revenueGrowth'))}", fontsize=10)
+    ax_right.text(0.5, 0.78, "Core Snapshot", ha='center', fontsize=11, fontweight='bold', transform=ax_right.transAxes)
+    pe_bench = u_details.get('sector_pe_benchmark', 20)
+    ax_right.text(0.07, 0.62, f"P/E: {u_details.get('pe') if u_details.get('pe') else 'n/a'} (Sector Avg: {pe_bench})", fontsize=10, transform=ax_right.transAxes)
+    ax_right.text(0.07, 0.50, f"P/B: {u_details.get('pb') if u_details.get('pb') else 'n/a'}", fontsize=10, transform=ax_right.transAxes)
+    ax_right.text(0.07, 0.38, f"ROE: {fmt_pct_val(u_details.get('roe'))}", fontsize=10, transform=ax_right.transAxes)
+    ax_right.text(0.07, 0.26, f"Rev Growth: {fmt_pct_val(u_details.get('revenueGrowth'))}", fontsize=10, transform=ax_right.transAxes)
 
     draw_kpi(ax_kpi_1, "Price", human_readable_price(price, price_ccy))
-    draw_kpi(ax_kpi_2, "Market Cap", human_readable_marketcap(mcap, mcap_ccy))
+    draw_kpi(ax_kpi_2, "Market Cap", human_readable_marketcap(mcap, mcap_ccy), small=True)
     draw_kpi(ax_kpi_3, "Undervalued", f"{u_score}/40", subtitle=f"{int(u_pct*100)}%")
     draw_kpi(ax_kpi_4, "Multibagger", f"{m_score}/50", subtitle=f"{int(m_pct*100)}%")
     gauge_bar(ax_gauge_u, u_pct, "Undervalued Score")
@@ -442,7 +822,7 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
 
     valuation_comp = 0.0
     pe_val = u_details.get('pe')
-    if pe_val and pe_val > 0: valuation_comp = max(0, min(1, (40 - pe_val) / 40))
+    if pe_val and pe_val > 0: valuation_comp = max(0, min(1, (pe_bench*1.5 - pe_val) / (pe_bench*1.5)))
     profitability_comp = 0.0
     roe_val = u_details.get('roe')
     if roe_val: profitability_comp = max(0, min(1, roe_val / 0.25))
@@ -478,10 +858,9 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
         y_top = 0.9 - row_idx * 0.18
         color = '#1aab2a' if passed else '#d93f3f'
         ax_pos.add_patch(patches.FancyBboxPatch((0.05, y_top-0.12), 0.9, 0.14, boxstyle="round,pad=0.02", color=color, ec=color))
-        ax_pos.text(0.07, y_top-0.05, label, va='center', ha='left', color='white', fontsize=10)
+        ax_pos.text(0.07, y_top-0.05, label, va='center', ha='left', color='white', fontsize=10, transform=ax_pos.transAxes)
 
     try:
-        # Re-fetch history for the plot (this is separate from the cached info)
         hist = yf.Ticker(ticker_used).history(period="12mo")
         if hist is not None and not hist.empty:
             if convert_usd: hist['Close'] = hist['Close'] * rate
@@ -493,7 +872,7 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
     except:
         ax_price.text(0.5, 0.5, "Price history fetch failed", ha='center', va='center')
 
-    plt.suptitle(f"{company} — Playbook Infographic", fontsize=16, fontweight='bold', y=0.995)
+    fig.suptitle(f"{company} — Playbook Infographic", fontsize=16, fontweight='bold', y=0.995)
     return fig
 
 # ==========================================
@@ -549,44 +928,59 @@ with st.sidebar:
     st.markdown('---')
     run_btn = st.button('▶ Generate Research Report', type='primary', use_container_width=True)
     
+    # --- EXPORT HUB (UPDATED) ---
     if st.session_state.get('analysis_done', False):
-        st.markdown("")
+        st.markdown("### 📥 Export Hub")
+        
+        # 1. Expanded Excel Export
         try:
             summ = st.session_state['summary']
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # Sheet 1: Summary
+                # Basic Sheets
                 pd.DataFrame([summ]).drop(columns=['fetched_info', 'yf_object'], errors='ignore').astype(str).to_excel(writer, sheet_name='Summary', index=False)
-                
-                # Re-create yf object for export (since we can't pickle it easily)
                 yf_obj_export = yf.Ticker(summ['ticker_used'])
-
-                # Sheet 2-4: Financials
-                if not yf_obj_export.financials.empty: 
-                    clean_financial_df(yf_obj_export.financials).to_excel(writer, sheet_name='Income_Statement')
-                if not yf_obj_export.balance_sheet.empty: 
-                    clean_financial_df(yf_obj_export.balance_sheet).to_excel(writer, sheet_name='Balance_Sheet')
-                if not yf_obj_export.cashflow.empty: 
-                    clean_financial_df(yf_obj_export.cashflow).to_excel(writer, sheet_name='Cash_Flow')
+                if not yf_obj_export.financials.empty: clean_financial_df(yf_obj_export.financials).to_excel(writer, sheet_name='Income_Statement')
+                if not yf_obj_export.balance_sheet.empty: clean_financial_df(yf_obj_export.balance_sheet).to_excel(writer, sheet_name='Balance_Sheet')
+                if not yf_obj_export.cashflow.empty: clean_financial_df(yf_obj_export.cashflow).to_excel(writer, sheet_name='Cash_Flow')
                 
-                # Auto-adjust column widths
+                # New Data Sheets (DCF & Risk)
+                if st.session_state.get('dcf_data'):
+                    pd.DataFrame([st.session_state['dcf_data']]).to_excel(writer, sheet_name='DCF_Model')
+                if st.session_state.get('risk_data'):
+                    pd.DataFrame([st.session_state['risk_data']]).to_excel(writer, sheet_name='Risk_Metrics')
+                
+                # Formatting
                 for sheet in writer.sheets.values():
                     for column in sheet.columns:
                         max_length = 0
                         column = [cell for cell in column]
                         for cell in column:
                             try:
-                                if len(str(cell.value)) > max_length:
-                                    max_length = len(str(cell.value))
+                                if len(str(cell.value)) > max_length: max_length = len(str(cell.value))
                             except: pass
-                        adjusted_width = (max_length + 2)
-                        sheet.column_dimensions[column[0].column_letter].width = adjusted_width
+                        sheet.column_dimensions[column[0].column_letter].width = max_length + 2
 
             output.seek(0)
-            st.download_button('📥 Download Excel Report', data=output, file_name=f"{summ['ticker_used']}_full_report.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
+            st.download_button('📥 Download Full Excel', data=output, file_name=f"{summ['ticker_used']}_full_report.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
         except Exception as e:
-            # st.warning(f"Export error: {e}")
             st.warning("Export requires 'openpyxl'. Please install it.")
+
+        # 2. PDF Export
+        if REPORTLAB_AVAILABLE:
+            if st.button("📄 Generate PDF Report", use_container_width=True):
+                # Retrieve chart data from session state
+                pdf_data = generate_comprehensive_pdf(
+                    st.session_state['summary'], 
+                    st.session_state.get('dcf_data'), 
+                    st.session_state.get('risk_data'),
+                    st.session_state.get('fig_visual'),
+                    st.session_state.get('fig_risk'),
+                    st.session_state.get('dcf_charts_data') 
+                )
+                st.download_button("⬇️ Download PDF", pdf_data, f"{st.session_state['summary']['ticker_used']}_Report.pdf", "application/pdf", use_container_width=True)
+        else:
+            st.warning("Install 'reportlab' to enable PDF export.")
 
     st.markdown("---")
     st.markdown(
@@ -598,33 +992,34 @@ with st.sidebar:
 # --- APP LOGIC ---
 
 if run_btn:
-    with st.spinner(f"📊 Analyzing {ticker_input}..."):
-        summary = run_playbook_for_ticker(ticker_input, country_code)
-        if summary:
-            # Handle currency conversion rate once
-            rate = 1.0
-            if use_usd and summary['price_currency'] != 'USD':
-                rate = get_currency_rate(summary['price_currency'], 'USD')
-            
-            st.session_state['summary'] = summary
-            st.session_state['usd_rate'] = rate
-            st.session_state['use_usd'] = use_usd
-            st.session_state['analysis_done'] = True
-            st.rerun()
-        else:
-            st.session_state['analysis_done'] = False
+    summary = run_playbook_for_ticker(ticker_input, country_code)
+    if summary:
+        rate = 1.0
+        if use_usd and summary['price_currency'] != 'USD':
+            rate = get_currency_rate(summary['price_currency'], 'USD')
+        
+        st.session_state['summary'] = summary
+        st.session_state['usd_rate'] = rate
+        st.session_state['use_usd'] = use_usd
+        st.session_state['analysis_done'] = True
+        # Reset data containers
+        st.session_state['dcf_data'] = None
+        st.session_state['risk_data'] = None
+        st.session_state['fig_visual'] = None
+        st.session_state['fig_risk'] = None
+        st.session_state['dcf_charts_data'] = None
+        st.rerun()
+    else:
+        st.session_state['analysis_done'] = False
 
 if st.session_state.get('analysis_done', False) and 'summary' in st.session_state:
     summary = st.session_state['summary']
     rate = st.session_state.get('usd_rate', 1.0)
     using_usd = st.session_state.get('use_usd', False)
 
-    # Re-instantiate yf object locally for UI elements that need it
     yf_obj = yf.Ticker(summary['ticker_used'])
-    # Inject it back into summary wrapper for consistency in helper calls
     summary['yf_object'] = yf_obj 
 
-    # Apply conversion for metrics display
     disp_price = summary['price'] * rate if using_usd and summary['price'] else summary['price']
     disp_mcap = summary['marketCap'] * rate if using_usd and summary['marketCap'] else summary['marketCap']
     disp_ccy = "USD" if using_usd else summary['price_currency']
@@ -636,33 +1031,294 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
     with col2:
         st.metric('📈 Market Cap', human_readable_marketcap(disp_mcap, disp_ccy))
     with col3:
-        underval_pct = min(100, int((summary['undervalued_score'] / 40) * 100))
-        st.metric('🎯 Undervalued', f"{summary['undervalued_score']}/40", f"{underval_pct}%")
+        st.metric('🎯 Undervalued', f"{summary['undervalued_score']}/40")
     with col4:
-        multibag_pct = min(100, int((summary['multibagger_score'] / 50) * 100))
-        st.metric('🚀 Multibagger', f"{summary['multibagger_score']}/50", f"{multibag_pct}%")
+        st.metric('🚀 Multibagger', f"{summary['multibagger_score']}/50")
 
     st.markdown('')
     
     # --- TABS ---
-    tab1, tab2, tab3, tab4 = st.tabs(["📊 Visual Report", "📈 Interactive Chart", "📋 Fundamental Analysis", "⚖️ Peer Comparison"])
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(["📊 Visual Report", "🛠️ Intrinsic Value (DCF)", "⚖️ Risk Analysis", "📈 Interactive Chart", "📋 Fundamental Analysis", "⚖️ Peer Comparison"])
     
+    # 1. VISUAL REPORT
     with tab1:
         st.markdown('<h3 style="color:#1B4D2B;">Visual Analysis Report</h3>', unsafe_allow_html=True)
         fig = render_infographic(summary, convert_usd=using_usd, rate=rate)
         if fig:
             st.pyplot(fig, use_container_width=True)
+            st.session_state['fig_visual'] = fig # SAVE FOR PDF
+            
+            # Simple Image Download
             fn = f"{summary['ticker_used']}_equity_research.png"
             img = io.BytesIO()
-            fig.savefig(img, format='png', bbox_inches='tight', dpi=150)
+            Canvas = FigureCanvasAgg(fig)
+            Canvas.print_png(img)
             img.seek(0)
-            plt.close(fig) # MEMORY FIX: Close figure
             st.markdown('<hr>', unsafe_allow_html=True)
             col_d1, col_d2, col_d3 = st.columns([1,1.5,1])
             with col_d2:
                 st.download_button('📥 Download High-Resolution Report', data=img, file_name=fn, mime='image/png', use_container_width=True)
 
+    # 2. INTRINSIC VALUE (FULLY AUTOMATED 3-WAY MODEL WITH CHARTS)
     with tab2:
+        st.markdown('<h3 style="color:#1B4D2B;">Institutional Valuation (DCF)</h3>', unsafe_allow_html=True)
+        
+        # 1. FETCH DATA REQUIRED FOR ALL MODELS
+        fcf_available = False
+        latest_fcf = 0
+        shares = yf_obj.info.get('sharesOutstanding')
+        try:
+            cf = yf_obj.cashflow
+            bs = yf_obj.balance_sheet
+            fin = yf_obj.financials
+            if not cf.empty:
+                possible_names = ['Free Cash Flow', 'Free Cash Flow', 'FreeCashFlow']
+                for name in possible_names:
+                    if name in cf.index:
+                        latest_fcf = cf.loc[name].iloc[0]
+                        fcf_available = True
+                        break
+        except: pass
+
+        if fcf_available and shares and not bs.empty and not fin.empty:
+            if using_usd and summary['price_currency'] != 'USD':
+                calc_fcf = latest_fcf * rate
+            else:
+                calc_fcf = latest_fcf
+
+            # 2. PERFORM AUTO CALCULATIONS
+            wacc, wacc_details = calculate_wacc_auto(yf_obj.info, fin, bs)
+            auto_growth = calculate_auto_growth(yf_obj.info)
+            perp_growth = 0.025
+
+            # Common Projections
+            future_fcf = [calc_fcf * ((1 + auto_growth) ** i) for i in range(1, 6)]
+            discount_factors = [1 / ((1 + wacc) ** i) for i in range(1, 6)]
+            dcf_vals = [f * d for f, d in zip(future_fcf, discount_factors)]
+            sum_pv_fcf = sum(dcf_vals)
+
+            # --- SUB TABS ---
+            subtab_auto, subtab_sens, subtab_exit = st.tabs(["🤖 Auto-WACC & Growth", "🌡️ Sensitivity Matrix", "🚪 Exit Multiple"])
+
+            # A. AUTO-ASSISTED DCF
+            with subtab_auto:
+                st.markdown(f"##### 🤖 Automated Discounted Cash Flow (Perpetual Growth)")
+                st.caption(f"Based on computed WACC: **{wacc:.1%}** and Sustainable Growth: **{auto_growth:.1%}**.")
+                
+                # Terminal Value
+                tv_perp = (future_fcf[-1] * (1 + perp_growth)) / (wacc - perp_growth)
+                pv_tv_perp = tv_perp / ((1 + wacc) ** 5)
+                equity_val_perp = sum_pv_fcf + pv_tv_perp
+                share_price_perp = equity_val_perp / shares
+                
+                upside = (share_price_perp - disp_price) / disp_price
+                
+                c_main1, c_main2 = st.columns([1, 2])
+                with c_main1:
+                    st.metric("Intrinsic Value", human_readable_price(share_price_perp, disp_ccy), f"{upside*100:.1f}%")
+                with c_main2:
+                    st.info(f"""
+                    **Model Inputs (Automated):**
+                    - Cost of Equity: {wacc_details['Cost of Equity']:.1%} (Risk Free: {wacc_details['Risk Free Rate']:.1%} + Beta: {wacc_details['Beta']:.2f})
+                    - Cost of Debt: {wacc_details['Cost of Debt (Pre-Tax)']:.1%} (After Tax)
+                    - WACC: {wacc:.1%}
+                    """)
+                
+                # SAVE DCF DATA FOR EXPORT
+                st.session_state['dcf_data'] = {
+                    "intrinsic_value": human_readable_price(share_price_perp, disp_ccy),
+                    "upside": f"{upside*100:.2f}%",
+                    "wacc": f"{wacc:.2%}",
+                    "growth_rate": f"{auto_growth:.2%}",
+                    "fcf_start": f"{calc_fcf:,.2f}"
+                }
+
+                # NEW CHART: Valuation Bridge (Waterfall)
+                bridge_data = pd.DataFrame({
+                    "Component": ["PV of Cash Flows (1-5Y)", "PV of Terminal Value", "Total Equity Value"],
+                    "Value": [sum_pv_fcf, pv_tv_perp, equity_val_perp]
+                })
+                # Prepare data for PDF capture (labels and raw values)
+                if st.session_state.get('dcf_charts_data') is None:
+                    st.session_state['dcf_charts_data'] = {}
+                
+                st.session_state['dcf_charts_data']['waterfall'] = {
+                    'labels': ["PV of Cash Flows", "Terminal Value", "Total Equity"],
+                    'values': [sum_pv_fcf, pv_tv_perp, equity_val_perp]
+                }
+
+                fig_bridge = go.Figure(go.Bar(
+                    x=bridge_data['Component'],
+                    y=bridge_data['Value'],
+                    marker_color=['#00C9FF', '#FF00FF', '#00C805'],
+                    text=[human_readable_generic(v, disp_ccy) for v in bridge_data['Value']],
+                    textposition='auto'
+                ))
+                fig_bridge.update_layout(title="Valuation Bridge: Where does the value come from?", template="plotly_dark", height=400, margin=dict(l=0, r=0, t=40, b=0))
+                st.plotly_chart(fig_bridge, use_container_width=True)
+
+            # B. SENSITIVITY ANALYSIS
+            with subtab_sens:
+                st.markdown("##### 🌡️ Valuation Heatmap (Banker's View)")
+                st.caption("Valuation range based on different WACC and Terminal Growth assumptions.")
+                
+                wacc_range = [wacc - 0.01, wacc - 0.005, wacc, wacc + 0.005, wacc + 0.01]
+                growth_range = [perp_growth - 0.01, perp_growth - 0.005, perp_growth, perp_growth + 0.005, perp_growth + 0.01]
+                
+                data = []
+                for w in wacc_range:
+                    row = []
+                    for g in growth_range:
+                        if w <= g: val = 0 
+                        else:
+                            tv = (future_fcf[-1] * (1 + g)) / (w - g)
+                            pv_tv = tv / ((1 + w) ** 5)
+                            val = (sum_pv_fcf + pv_tv) / shares
+                        row.append(val)
+                    data.append(row)
+                
+                # Capture Sensitivity Data for PDF
+                if st.session_state.get('dcf_charts_data'):
+                    st.session_state['dcf_charts_data']['sensitivity'] = {
+                        'matrix': pd.DataFrame(data, index=[f"{w:.1%}" for w in wacc_range], columns=[f"{g:.1%}" for g in growth_range]),
+                        'rows': wacc_range,
+                        'cols': growth_range
+                    }
+
+                # 1. Styled DataFrame (FIXED FORMATTING using Lambda)
+                df_sens = pd.DataFrame(data, index=[f"WACC {w:.1%}" for w in wacc_range], columns=[f"Term Growth {g:.1%}" for g in growth_range])
+                # Using a lambda to ensure strict string formatting
+                st.dataframe(df_sens.style.format(lambda x: f"{_get_currency_symbol(disp_ccy)}{x:,.2f}").background_gradient(cmap='RdYlGn', axis=None), use_container_width=True)
+
+                # 2. NEW CHART: Interactive 3D Surface/Heatmap
+                fig_heat = go.Figure(data=go.Heatmap(
+                    z=data,
+                    x=[f"{g:.1%}" for g in growth_range],
+                    y=[f"{w:.1%}" for w in wacc_range],
+                    colorscale='RdYlGn',
+                    texttemplate="%{z:.0f}",
+                    hoverongaps=False
+                ))
+                fig_heat.update_layout(title="Sensitivity Heatmap (Interactive)", xaxis_title="Terminal Growth", yaxis_title="WACC", template="plotly_dark", height=400)
+                st.plotly_chart(fig_heat, use_container_width=True)
+
+            # C. EXIT MULTIPLE METHOD
+            with subtab_exit:
+                st.markdown("##### 🚪 Exit Multiple Method (Private Equity Style)")
+                st.caption("Valuation assuming sale at a multiple of EBITDA in Year 5.")
+                
+                ebitda = 0
+                if 'EBITDA' in fin.index:
+                    ebitda = fin.loc['EBITDA'].iloc[0]
+                
+                if ebitda > 0:
+                    ebitda_y5 = ebitda * ((1 + auto_growth) ** 5)
+                    sector_mult = 12.0 
+                    tv_exit = ebitda_y5 * sector_mult
+                    pv_tv_exit = tv_exit / ((1 + wacc) ** 5)
+                    equity_val_exit = sum_pv_fcf + pv_tv_exit
+                    share_price_exit = equity_val_exit / shares
+                    upside_exit = (share_price_exit - disp_price) / disp_price
+                    
+                    c_ex1, c_ex2 = st.columns(2)
+                    with c_ex1:
+                        st.metric("Intrinsic Value (Exit Multiple)", human_readable_price(share_price_exit, disp_ccy), f"{upside_exit*100:.1f}%")
+                    with c_ex2:
+                        st.write(f"Assumed Exit Multiple: **{sector_mult}x EBITDA**")
+                        st.write(f"Projected Year 5 EBITDA: {human_readable_generic(ebitda_y5, disp_ccy)}")
+                        
+                    # NEW CHART: Methodology Face-off
+                    comp_df = pd.DataFrame({
+                        "Method": ["Perpetual Growth", "Exit Multiple"],
+                        "Share Price": [share_price_perp, share_price_exit]
+                    })
+                    fig_comp = go.Figure(go.Bar(
+                        x=comp_df["Method"],
+                        y=comp_df["Share Price"],
+                        marker_color=['#00C9FF', '#FFD700'],
+                        text=[human_readable_price(p, disp_ccy) for p in comp_df["Share Price"]],
+                        textposition='auto'
+                    ))
+                    fig_comp.add_hline(y=disp_price, line_dash="dash", line_color="red", annotation_text="Current Price")
+                    fig_comp.update_layout(title="Methodology Comparison", template="plotly_dark", height=400)
+                    st.plotly_chart(fig_comp, use_container_width=True)
+                    
+                else:
+                    st.warning("Negative or missing EBITDA. Cannot perform Exit Multiple analysis.")
+
+        else:
+            st.warning("Insufficient financial data (FCF, Debt, or Shares) to auto-calculate valuation.")
+
+    # 3. RISK ANALYSIS (UPDATED WITH INTERPRETATIONS)
+    with tab3:
+        st.markdown('<h3 style="color:#1B4D2B;">Risk Analysis</h3>', unsafe_allow_html=True)
+        
+        bench_ticker = "^GSPC" 
+        if country_code == "IN": bench_ticker = "^NSEI" 
+        
+        with st.spinner("Calculating Risk Metrics..."):
+            try:
+                end_date = datetime.now()
+                start_date = end_date - pd.Timedelta(days=365)
+                stock_hist = yf_obj.history(start=start_date, end=end_date)
+                bench_hist = yf.Ticker(bench_ticker).history(start=start_date, end=end_date)
+                
+                if not stock_hist.empty and not bench_hist.empty:
+                    beta = calculate_beta(stock_hist, bench_hist)
+                    var_95 = calculate_var(stock_hist, 0.95)
+                    max_drawdown = (stock_hist['Close'].min() - stock_hist['Close'].max()) / stock_hist['Close'].max()
+                    
+                    # SAVE RISK DATA FOR EXPORT
+                    st.session_state['risk_data'] = {
+                        "beta": f"{beta:.2f}" if beta else "N/A",
+                        "var": f"{var_95*100:.2f}%" if var_95 else "N/A",
+                        "drawdown": f"{max_drawdown*100:.2f}%"
+                    }
+
+                    # METRICS ROW
+                    c_r1, c_r2, c_r3 = st.columns(3)
+                    with c_r1:
+                        st.metric("Beta", f"{beta:.2f}" if beta else "N/A")
+                        if beta:
+                            interp = "High Volatility (Aggressive)" if beta > 1.2 else "Low Volatility (Defensive)" if beta < 0.8 else "Market correlated"
+                            st.caption(f"**Inference:** {interp}")
+                    with c_r2:
+                        var_val = var_95 * 100 if var_95 else 0
+                        st.metric("VaR (95%)", f"{var_val:.2f}%")
+                        st.caption(f"**Meaning:** 95% confidence you won't lose more than {abs(var_val):.1f}% in a single day.")
+                    with c_r3:
+                        st.metric("Max Drawdown (1Y)", f"{max_drawdown*100:.2f}%")
+                        st.caption("**Meaning:** The worst drop from peak to bottom this year.")
+
+                    # DISTRIBUTION CHART
+                    st.markdown("#### 📉 Volatility Distribution")
+                    rets = stock_hist['Close'].pct_change().dropna()
+                    
+                    # Matplotlib Figure for both Display AND PDF
+                    fig_dist = Figure(figsize=(10, 4))
+                    ax_dist = fig_dist.subplots()
+                    sns.histplot(rets, kde=True, ax=ax_dist, color="orange", bins=50)
+                    ax_dist.axvline(var_95, color='red', linestyle='--', label=f'VaR 95%: {var_val:.2f}%')
+                    ax_dist.set_title("Daily Returns Distribution (Fat tails = Higher Risk)")
+                    ax_dist.legend()
+                    st.pyplot(fig_dist)
+                    
+                    st.session_state['fig_risk'] = fig_dist # SAVE FOR PDF
+                    
+                    st.info("""
+                    **How to interpret this graph:**
+                    - **The Peak:** Most daily price changes happen here (usually near 0%).
+                    - **The Width:** A wider curve means the stock is wild and volatile. A narrow curve means it's stable.
+                    - **The Red Line (VaR):** This is your 'danger zone'. Returns to the left of this line represent the worst 5% of trading days.
+                    """)
+                    
+                else:
+                    st.warning("Insufficient historical data for risk metrics.")
+            except Exception as e:
+                st.error(f"Risk calc error: {e}")
+
+    # 4. TECHNICALS
+    with tab4:
         st.markdown('<h3 style="color:#1B4D2B;">Advanced Technical Chart</h3>', unsafe_allow_html=True)
         col_c1, col_c2, col_c3 = st.columns(3)
         with col_c1:
@@ -686,17 +1342,14 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 row_heights = [0.7, 0.3]
                 fig_plotly = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.05, row_heights=row_heights, subplot_titles=(f"{summary['ticker_used']} Price", oscillator))
 
-                # Price Candle
                 fig_plotly.add_trace(go.Candlestick(x=hist.index, open=hist['Open'], high=hist['High'], low=hist['Low'], close=hist['Close'], name='Price'), row=1, col=1)
 
-                # Overlays
                 if "SMA 50" in indicators: fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA50'], line=dict(color='orange', width=1.5), name='SMA 50'), row=1, col=1)
                 if "SMA 200" in indicators: fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['SMA200'], line=dict(color='blue', width=1.5), name='SMA 200'), row=1, col=1)
                 if "Bollinger Bands" in indicators:
                     fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Upper'], line=dict(color='gray', width=1, dash='dot'), showlegend=False), row=1, col=1)
                     fig_plotly.add_trace(go.Scatter(x=hist.index, y=hist['BB_Lower'], line=dict(color='gray', width=1, dash='dot'), fill='tonexty', fillcolor='rgba(128,128,128,0.1)', name='BB'), row=1, col=1)
 
-                # Oscillators
                 if oscillator == "Volume":
                     fig_plotly.add_trace(go.Bar(x=hist.index, y=hist['Volume'], marker_color='teal', name='Volume'), row=2, col=1)
                 elif oscillator == "RSI":
@@ -717,7 +1370,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
         except Exception as e:
             st.error(f"Error creating chart: {e}")
 
-    with tab3:
+    with tab5:
         st.markdown('<h3 style="color:#1B4D2B;">Deep Dive Analysis</h3>', unsafe_allow_html=True)
         info = summary['fetched_info']
 
@@ -750,62 +1403,35 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
         with subtab_rec:
             st.markdown("#### Analyst Consensus")
             
-            # 1. Fetch Recommendation Mean (Score 1.0 - 5.0)
             rec_mean = info.get('recommendationMean')
-            rec_key = info.get('recommendationKey', '').replace('_', ' ').title() # e.g., "Strong Buy"
+            rec_key = info.get('recommendationKey', '').replace('_', ' ').title() 
             
             if rec_mean:
                 col_gauge, col_text = st.columns([2, 1])
-                
                 with col_gauge:
-                    # LOGIC INVERSION: 
-                    # Standard Yahoo: 1 = Strong Buy (Left), 5 = Strong Sell (Right)
-                    # Your Request:   Sell on Left, Buy on Right.
-                    # Math: New_Value = 6 - Old_Value (e.g., Old 1 becomes 5)
                     plot_value = 6 - rec_mean
-
-                    # Create Speedometer
                     fig_gauge = go.Figure(go.Indicator(
                         mode = "gauge+number",
                         value = plot_value, 
                         domain = {'x': [0, 1], 'y': [0, 1]},
                         title = {'text': f"Consensus: {rec_key}", 'font': {'size': 24, 'color': '#AEE7B1'}},
-                        # Display the ORIGINAL score (1-5) in the center, or remove standard number if confusing
                         number = {'font': {'size': 40, 'color': 'white'}, 'suffix': " Score"}, 
                         gauge = {
-                            'axis': {
-                                'range': [1, 5], 
-                                'tickwidth': 1, 
-                                'tickcolor': "white", 
-                                # LABELS REVERSED: Sell on Left (1), Buy on Right (5)
-                                'ticktext': ['Strong Sell', 'Sell', 'Hold', 'Buy', 'Strong Buy'], 
-                                'tickvals': [1, 2, 3, 4, 5]
-                            },
-                            'bar': {'color': "white", 'thickness': 0.02}, # Thin needle
+                            'axis': {'range': [1, 5], 'tickwidth': 1, 'tickcolor': "white", 'ticktext': ['Strong Sell', 'Sell', 'Hold', 'Buy', 'Strong Buy'], 'tickvals': [1, 2, 3, 4, 5]},
+                            'bar': {'color': "white", 'thickness': 0.02}, 
                             'bgcolor': "rgba(0,0,0,0)",
                             'borderwidth': 0,
-                            # COLORS REVERSED: Red on Left, Green on Right
                             'steps': [
-                                {'range': [1, 1.8], 'color': "#FF0000"},    # Strong Sell (Red)
-                                {'range': [1.8, 2.6], 'color': "#FF8C00"},  # Sell (Orange)
-                                {'range': [2.6, 3.4], 'color': "#FFD700"},  # Hold (Yellow)
-                                {'range': [3.4, 4.2], 'color': "#88E338"},  # Buy (Light Green)
-                                {'range': [4.2, 5], 'color': "#00C805"}     # Strong Buy (Green)
+                                {'range': [1, 1.8], 'color': "#FF0000"},    
+                                {'range': [1.8, 2.6], 'color': "#FF8C00"},  
+                                {'range': [2.6, 3.4], 'color': "#FFD700"},  
+                                {'range': [3.4, 4.2], 'color': "#88E338"},  
+                                {'range': [4.2, 5], 'color': "#00C805"}     
                             ],
-                            'threshold': {
-                                'line': {'color': "white", 'width': 4},
-                                'thickness': 0.75,
-                                'value': plot_value
-                            }
+                            'threshold': {'line': {'color': "white", 'width': 4}, 'thickness': 0.75, 'value': plot_value}
                         }
                     ))
-                    # MARGIN FIX: Increased 't' (top) from 40 to 80 to prevent title cutoff
-                    fig_gauge.update_layout(
-                        paper_bgcolor = "rgba(0,0,0,0)", 
-                        font = {'color': "white", 'family': "Inter"}, 
-                        height=350, 
-                        margin=dict(l=30, r=30, t=80, b=20) 
-                    )
+                    fig_gauge.update_layout(paper_bgcolor = "rgba(0,0,0,0)", font = {'color': "white", 'family': "Inter"}, height=350, margin=dict(l=30, r=30, t=80, b=20))
                     st.plotly_chart(fig_gauge, use_container_width=True)
 
                 with col_text:
@@ -816,14 +1442,11 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                         <br>
                         <div style="font-size: 14px; color: #888;">Actual Yahoo Score</div>
                         <div style="font-size: 18px; font-weight: bold; color: #AEE7B1;">{rec_mean}</div>
-                        <div style="font-size: 10px; color: #666;">(1.0 = Strong Buy)</div>
                     </div>
                     """, unsafe_allow_html=True)
-
             else:
                 st.info("No sufficient analyst data to generate a gauge.")
 
-            # 2. Price Target Metric
             target = info.get('targetMeanPrice')
             current = info.get('regularMarketPrice')
             if target and current:
@@ -832,40 +1455,61 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 st.metric("Mean Analyst Price Target", human_readable_price(target, summary['price_currency']), f"{delta:.2f}% Upside")
 
         with subtab_news:
+            # IMPROVED NEWS LOGIC with rigorous None checking
             valid_news_count = 0
+            
+            # 1. Try Yahoo Finance News
             try:
                 yf_news = yf_obj.news
                 if yf_news and isinstance(yf_news, list):
                     for item in yf_news[:5]:
                         if not isinstance(item, dict): continue
+                        
+                        # Strict checking for title
                         title = item.get('title')
-                        if not title: continue
+                        if not title or title.strip() == "" or title.lower() == "none": continue
+                        
+                        # Filter out common Yahoo boilerplate
+                        if "yahoo finance" in title.lower() and len(title) < 20: continue
+                        
                         link = item.get('link', '#')
                         publisher = item.get('publisher', 'Yahoo Finance')
+                        
+                        # Format Date
                         pub_time_raw = item.get('providerPublishTime')
-                        pub_time_str = datetime.fromtimestamp(pub_time_raw).strftime('%Y-%m-%d') if pub_time_raw else "Recent"
+                        pub_time_str = "Recent"
+                        if pub_time_raw:
+                            try:
+                                pub_time_str = datetime.fromtimestamp(pub_time_raw).strftime('%Y-%m-%d')
+                            except: pass
+                            
                         st.markdown(f"""<div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #2D7A3E;"><a href="{link}" target="_blank" style="color: #AEE7B1; font-weight: bold; text-decoration: none;">{title}</a><div style="color: #888; font-size: 12px;">{pub_time_str} • {publisher}</div></div>""", unsafe_allow_html=True)
                         valid_news_count += 1
             except: pass
             
+            # 2. Fallback if YF failed or returned nothing valid
             if valid_news_count == 0:
                 fallback_news = fetch_news_fallback(summary['ticker_used'])
                 if fallback_news:
                     for item in fallback_news:
-                        st.markdown(f"""<div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #F59E0B;"><a href="{item['link']}" target="_blank" style="color: #FCD34D; font-weight: bold; text-decoration: none;">{item['title']}</a><div style="color: #888; font-size: 12px;">{item['providerPublishTime']} • {item['publisher']}</div></div>""", unsafe_allow_html=True)
-                else: st.info("No news found.")
+                        title = item.get('title')
+                        if not title or title.lower() == "no title": continue
+                        
+                        st.markdown(f"""<div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #F59E0B;"><a href="{item['link']}" target="_blank" style="color: #FCD34D; font-weight: bold; text-decoration: none;">{title}</a><div style="color: #888; font-size: 12px;">{item['providerPublishTime']} • {item['publisher']}</div></div>""", unsafe_allow_html=True)
+                        valid_news_count += 1
+            
+            if valid_news_count == 0:
+                st.info("No recent news found for this ticker.")
 
-    with tab4:
+    with tab6:
         st.markdown('<h3 style="color:#1B4D2B;">Peer Comparison</h3>', unsafe_allow_html=True)
         peer_input = st.text_input("Enter Peer Tickers (comma separated)", placeholder="e.g. MSFT, GOOGL, META")
         compare_btn = st.button("Compare Peers")
         
-        # --- NEW PARALLELIZED LOGIC ---
         if compare_btn and peer_input:
             peers = [x.strip().upper() for x in peer_input.split(',') if x.strip()]
             peers.insert(0, summary['ticker_used']) 
             
-            # Function to run in parallel
             def fetch_peer_data(p_ticker):
                 try:
                     p_obj = yf.Ticker(p_ticker)
@@ -887,11 +1531,8 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             
             comparison_data = []
             with st.spinner(f"Fetching data for {len(peers)} tickers..."):
-                # Use ThreadPoolExecutor to run fetch_peer_data for all tickers at once
                 with concurrent.futures.ThreadPoolExecutor() as executor:
                     results = list(executor.map(fetch_peer_data, peers))
-                
-                # Filter out failures
                 comparison_data = [r for r in results if r is not None]
 
             if comparison_data:
@@ -913,6 +1554,8 @@ else:
                 <li><strong>Interactive Technicals</strong>: RSI, MACD, Bollinger Bands, and Volume analysis.</li>
                 <li><strong>Deep Fundamental Data</strong>: Access Income Statements, Balance Sheets, and Cash Flows.</li>
                 <li><strong>Peer Benchmarking</strong>: Compare key ratios against competitors instantly.</li>
+                <li><strong>NEW: DCF Calculator</strong>: 3 Models (Auto, Matrix, Exit Multiple).</li>
+                <li><strong>NEW: Risk Metrics</strong>: Interpretable Risk & Volatility Analysis.</li>
             </ul>
         </div>
         ''', unsafe_allow_html=True)
