@@ -411,9 +411,12 @@ def score_multibagger_from_info(info):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_playbook_for_ticker(ticker_input, country_code=""):
+    # MODIFIED: Catch errors and display them instead of returning None silently
     try:
         info, used_variant = fetch_info_with_variants(ticker_input, country_code)
     except Exception as e:
+        # This will show a red error box in the app with the specific reason for failure
+        st.error(f"❌ Data Fetch Error: {e}") 
         return None
 
     yf_obj = yf.Ticker(used_variant)
@@ -442,7 +445,6 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
         "as_of": datetime.utcnow().isoformat() + "Z"
     }
     return summary
-
 # --- PDF GENERATOR (COMPLETE & INTERPRETABLE) ---
 def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fig, dcf_charts):
     buffer = io.BytesIO()
@@ -919,7 +921,7 @@ st.markdown('<hr>', unsafe_allow_html=True)
 
 with st.sidebar:
     st.markdown('<h3 style="color:#2D7A3E;">Configuration</h3>', unsafe_allow_html=True)
-    ticker_input = st.text_input('', value='AAPL', placeholder='e.g., AAPL, MSFT', key='ticker_input', label_visibility='collapsed')
+    ticker_input = st.text_input('Ticker Symbol', value='AAPL', placeholder='e.g., AAPL, MSFT', key='ticker_input', label_visibility='collapsed')
     country_code = st.selectbox('Market Region', ['US','IN','GB','DE','FR','CA','JP'], index=0)
     
     st.markdown("#### Settings")
@@ -1567,3 +1569,4 @@ else:
             <p style="color:#6B7280; margin:0; font-size:14px; line-height:1.6;">Start by entering a stock ticker in the sidebar.</p>
         </div>
         ''', unsafe_allow_html=True)
+
