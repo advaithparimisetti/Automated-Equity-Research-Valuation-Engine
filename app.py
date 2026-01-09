@@ -36,7 +36,7 @@ except Exception:
 
 sns.set_style("whitegrid")
 
-# SECTOR BENCHMARKS FOR VALUATION
+# SECTOR BENCHMARKS FOR VALUATION & EXIT MULTIPLES
 SECTOR_PE_MAP = {
     "Technology": 25, "Financial Services": 12, "Healthcare": 20,
     "Consumer Cyclical": 18, "Industrials": 18, "Energy": 10,
@@ -86,7 +86,7 @@ def get_risk_free_rate():
             return hist['Close'].iloc[-1] / 100.0
     except:
         pass
-    return 0.04 
+    return 0.042 # Institutional anchor (4.2%)
 
 def format_large_number(n):
     if n is None: return "N/A"
@@ -246,86 +246,162 @@ def fetch_news_fallback(ticker):
         pass
     return news_items
 
-# --- FINANCIAL MODELING HELPERS ---
-def calculate_wacc_auto(info, financials, balance_sheet):
+# --- FINANCIAL MODELING HELPERS (INSTITUTIONAL GRADE) ---
+def calculate_wacc_institutional(info, financials, balance_sheet):
+    """
+    Calculates Dual WACC (Base & Stress):
+    1. Base Case: Normalized inputs (Beta ~1.1-1.3, ERP 5.25%).
+    2. Stress Case: High inputs (Beta capped 1.6, higher risk).
+    """
     try:
-        rf = get_risk_free_rate()
-        beta = info.get('beta')
-        if beta is None: beta = 1.0
-        market_prem = 0.055 
-        cost_equity = rf + beta * market_prem
+        # 1. Inputs & Normalization
+        raw_beta = info.get('beta')
+        if raw_beta is None: raw_beta = 1.0
         
-        interest_expense = 0
+        # Blume Adjustment (Standardize)
+        adj_beta = (raw_beta * 0.67) + (1.0 * 0.33)
+        
+        # Beta Scenarios
+        beta_stress = min(adj_beta, 1.60) # Capped at 1.6 for stress
+        beta_base = min(adj_beta, 1.25)   # Normalized to ~1.25 for Base Case (Megacap/Moat standard)
+
+        # Macro Inputs
+        rf = get_risk_free_rate()
+        rf = max(0.035, min(rf, 0.050)) # Clamp 3.5% - 5.0%
+        
+        erp = 0.0525
+        
+        # Cost of Equity
+        ke_stress = rf + (beta_stress * erp)
+        ke_base = rf + (beta_base * erp)
+
+        # 2. Capital Structure
+        market_cap = info.get('marketCap', 0)
         total_debt = 0
         
-        if not financials.empty:
-            if 'Interest Expense' in financials.index:
-                interest_expense = abs(financials.loc['Interest Expense'].iloc[0])
-            elif 'Interest Expense Non Operating' in financials.index:
-                interest_expense = abs(financials.loc['Interest Expense Non Operating'].iloc[0])
-                
         if not balance_sheet.empty:
-            if 'Total Debt' in balance_sheet.index:
-                total_debt = balance_sheet.loc['Total Debt'].iloc[0]
+            for col in ['Total Debt', 'Long Term Debt', 'LongTermDebt']:
+                if col in balance_sheet.index:
+                    total_debt = balance_sheet.loc[col].iloc[0]
+                    break
+
+        if market_cap is None or market_cap == 0:
+            market_cap = 1 
+            
+        total_val = market_cap + total_debt
+        w_e = market_cap / total_val
+        w_d = total_debt / total_val
+
+        # 3. Cost of Debt
+        interest_expense = 0
+        if not financials.empty:
+             for col in ['Interest Expense', 'Interest Expense Non Operating']:
+                if col in financials.index:
+                    interest_expense = abs(financials.loc[col].iloc[0])
+                    break
         
-        tax_rate = 0.21 
+        tax_rate = 0.21
         if not financials.empty and 'Tax Provision' in financials.index and 'Pretax Income' in financials.index:
             try:
                 taxes = financials.loc['Tax Provision'].iloc[0]
                 pretax = financials.loc['Pretax Income'].iloc[0]
                 if pretax != 0:
-                    calc_tax = taxes / pretax
-                    if 0 < calc_tax < 0.5: 
-                        tax_rate = calc_tax
+                    eff_tax = taxes / pretax
+                    if 0.15 < eff_tax < 0.30: tax_rate = eff_tax
             except: pass
 
         if total_debt > 0 and interest_expense > 0:
-            cost_debt = (interest_expense / total_debt)
+            cost_debt_pre = (interest_expense / total_debt)
+            cost_debt_pre = min(cost_debt_pre, 0.10) 
         else:
-            cost_debt = rf + 0.02 
-            
-        cost_debt_after_tax = cost_debt * (1 - tax_rate)
+            cost_debt_pre = rf + 0.015 
+
+        cost_debt_after_tax = cost_debt_pre * (1 - tax_rate)
+
+        # 4. WACC Calculation (Dual)
+        wacc_stress = (w_e * ke_stress) + (w_d * cost_debt_after_tax)
+        wacc_base = (w_e * ke_base) + (w_d * cost_debt_after_tax)
         
-        market_cap = info.get('marketCap', 0)
-        if market_cap is None or market_cap == 0:
-            raise ValueError("No Market Cap")
-            
-        total_val = market_cap + total_debt
-        w_e = market_cap / total_val
-        w_d = total_debt / total_val
-        
-        wacc = (w_e * cost_equity) + (w_d * cost_debt_after_tax)
-        
+        # Clamp Logic
+        wacc_stress = max(0.08, min(wacc_stress, 0.14)) # Stress range 8-14%
+        wacc_base = max(0.07, min(wacc_base, 0.11))     # Base range 7-11%
+
         details = {
             "Risk Free Rate": rf,
-            "Beta": beta,
-            "Cost of Equity": cost_equity,
-            "Cost of Debt (Pre-Tax)": cost_debt,
-            "WACC": wacc
+            "Beta (Base/Stress)": f"{beta_base:.2f} / {beta_stress:.2f}",
+            "ERP": erp,
+            "Cost of Equity (Base)": ke_base,
+            "WACC (Base)": wacc_base,
+            "WACC (Stress)": wacc_stress
         }
-        return wacc, details
-    except:
-        fallback_details = {
-            "Risk Free Rate": 0.04,
-            "Beta": 1.0,
-            "Cost of Equity": 0.10,
-            "Cost of Debt (Pre-Tax)": 0.05,
-            "WACC": 0.10
-        }
-        return 0.10, fallback_details
+        return wacc_base, wacc_stress, details
+    except Exception:
+        return 0.10, 0.125, {"Note": "Fallback"}
 
 def calculate_auto_growth(info):
+    """
+    Calculates Explicit Period Growth (Years 1-5).
+    """
     try:
-        roe = info.get('returnOnEquity', 0.10)
-        if roe is None: roe = 0.10
+        roe = info.get('returnOnEquity', 0.15)
+        if roe is None: roe = 0.15
         payout = info.get('payoutRatio', 0.0)
         if payout is None: payout = 0.0
         retention = 1 - payout
+        
         growth = roe * retention
-        growth = max(0.02, min(growth, 0.20)) 
+        growth = max(0.05, min(growth, 0.25)) # Cap at 25%
         return growth
     except:
-        return 0.05
+        return 0.10
+
+def calculate_normalized_fcf(yf_obj, reported_fcf):
+    """
+    SURGICAL UPGRADE: Normalize Starting FCF.
+    Uses 3-year average FCF margin on TTM Revenue.
+    """
+    try:
+        financials = yf_obj.financials
+        cashflow = yf_obj.cashflow
+        
+        if financials.empty or cashflow.empty:
+            return reported_fcf
+
+        if 'Total Revenue' in financials.index:
+            rev_history = financials.loc['Total Revenue']
+        elif 'TotalRevenue' in financials.index:
+            rev_history = financials.loc['TotalRevenue']
+        else:
+            return reported_fcf
+
+        common_cols = rev_history.index.intersection(cashflow.columns)
+        margins = []
+        for col in common_cols[:3]: 
+            try:
+                ocf = 0
+                if 'Operating Cash Flow' in cashflow.index:
+                    ocf = cashflow.loc['Operating Cash Flow'][col]
+                elif 'Total Cash From Operating Activities' in cashflow.index:
+                    ocf = cashflow.loc['Total Cash From Operating Activities'][col]
+                
+                capex = 0
+                if 'Capital Expenditure' in cashflow.index:
+                    capex = cashflow.loc['Capital Expenditure'][col]
+                
+                fcf = ocf + capex if capex < 0 else ocf - capex
+                rev = rev_history[col]
+                if rev > 0: margins.append(fcf / rev)
+            except: pass
+        
+        if not margins: return reported_fcf
+            
+        avg_margin = sum(margins) / len(margins)
+        ttm_rev = rev_history.iloc[0]
+        normalized_fcf = ttm_rev * avg_margin
+        
+        return max(reported_fcf, normalized_fcf)
+    except Exception:
+        return reported_fcf
 
 # --- RISK METRICS ---
 def calculate_beta(stock_hist, market_hist):
@@ -411,11 +487,9 @@ def score_multibagger_from_info(info):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def run_playbook_for_ticker(ticker_input, country_code=""):
-    # MODIFIED: Catch errors and display them instead of returning None silently
     try:
         info, used_variant = fetch_info_with_variants(ticker_input, country_code)
     except Exception as e:
-        # This will show a red error box in the app with the specific reason for failure
         st.error(f"❌ Data Fetch Error: {e}") 
         return None
 
@@ -445,6 +519,7 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
         "as_of": datetime.utcnow().isoformat() + "Z"
     }
     return summary
+
 # --- PDF GENERATOR (COMPLETE & INTERPRETABLE) ---
 def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fig, dcf_charts):
     buffer = io.BytesIO()
@@ -527,7 +602,7 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
     
     metrics_data = [
         ["Metric", "Value", "Metric", "Value"],
-        ["Undervalued Score", f"{summary['undervalued_score']}/40", "Growth Score", f"{summary['multibagger_score']}/50"],
+        ["Value Score", f"{summary['undervalued_score']}/40", "Growth Score", f"{summary['multibagger_score']}/50"],
         ["P/E Ratio", f"{details.get('pe', 'N/A')}", "ROE", f"{fmt_pct_val(details.get('roe'))}"],
         ["Sector Avg P/E", f"{details.get('sector_pe_benchmark', 'N/A')}", "Revenue Growth", f"{fmt_pct_val(details.get('revenueGrowth'))}"],
         ["Debt/Equity", f"{details.get('debtToEquity', 'N/A')}", "Gross Margin", f"{fmt_pct_val(m_details.get('grossMargins'))}"]
@@ -547,10 +622,12 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
     t_metrics.drawOn(c, 40, y_metrics - 120)
 
     # 3. Analyst Verdict (Auto-Generated)
-    verdict = "Undervalued" if summary['undervalued_score'] > 25 else "Fair Value/Overvalued"
-    verdict_text = f"Based on the algorithmic scoring, {summary['company']} is currently rated as <b>{verdict}</b> relative to its historicals and sector peers. The company has a Fundamental Score of {summary['undervalued_score']}/40."
+    # FIX 1: Recommendation Language ("Screens as...")
+    verdict = "Screens as Undervalued (Model-Based)" if summary['undervalued_score'] > 25 else "Screens as Fairly Valued / Overvalued (Model-Based)"
+    verdict_text = f"Based on the algorithmic scoring, {summary['company']} <b>{verdict}</b> relative to its historicals and sector peers. The company has a Fundamental Score of {summary['undervalued_score']}/40."
     
-    draw_insight_box(c, 40, y_metrics - 220, 530, 80, "Algorithmic Verdict", verdict_text)
+    # FIX 1: "Algorithmic Verdict" -> "Model Output Summary"
+    draw_insight_box(c, 40, y_metrics - 220, 530, 80, "Model Output Summary", verdict_text)
 
     draw_footer(c)
     c.showPage()
@@ -586,8 +663,9 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
         c.drawImage(ImageReader(img_buf), 30, current_y, width=350, height=175, preserveAspectRatio=True)
         
         # Draw Insight
+        # FIX 3: "Intrinsic Value" -> "Model-Implied Intrinsic Value"
         term_pct = (vals[1] / vals[2]) * 100 if vals[2] > 0 else 0
-        insight_text = f"This chart breaks down the Intrinsic Value. Notice that <b>{term_pct:.1f}%</b> of the value comes from the Terminal Value (years 5+). This indicates the valuation is highly dependent on long-term stability rather than short-term cash flows."
+        insight_text = f"This chart breaks down the Model-Implied Intrinsic Value. Notice that <b>{term_pct:.1f}%</b> of the value comes from the Terminal Value. This indicates the valuation is highly dependent on long-term stability rather than short-term cash flows."
         draw_insight_box(c, 400, current_y + 20, 180, 140, "Analyst Commentary", insight_text)
         
         current_y -= 50
@@ -627,9 +705,7 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
         # Simplified bar chart
         fig_c = Figure(figsize=(6, 2), dpi=100)
         ax_c = fig_c.subplots()
-        methods = ["Perpetual Growth", "Exit Multiple (12x)"]
-        # We need to recalculate Exit Multiple quickly or just visualize placeholders if data missing
-        # For robustness, we will visualize the Intrinsic Value vs Current Price
+        methods = ["Perpetual Growth", "Exit Multiple"]
         
         try:
             curr_price = summary['price']
@@ -817,10 +893,11 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
 
     draw_kpi(ax_kpi_1, "Price", human_readable_price(price, price_ccy))
     draw_kpi(ax_kpi_2, "Market Cap", human_readable_marketcap(mcap, mcap_ccy), small=True)
-    draw_kpi(ax_kpi_3, "Undervalued", f"{u_score}/40", subtitle=f"{int(u_pct*100)}%")
-    draw_kpi(ax_kpi_4, "Multibagger", f"{m_score}/50", subtitle=f"{int(m_pct*100)}%")
-    gauge_bar(ax_gauge_u, u_pct, "Undervalued Score")
-    gauge_bar(ax_gauge_m, m_pct, "Multibagger Score")
+    # FIX 1: Recommendation Language
+    draw_kpi(ax_kpi_3, "Value Score", f"{u_score}/40", subtitle=f"{int(u_pct*100)}%")
+    draw_kpi(ax_kpi_4, "Growth Score", f"{m_score}/50", subtitle=f"{int(m_pct*100)}%")
+    gauge_bar(ax_gauge_u, u_pct, "Value Score")
+    gauge_bar(ax_gauge_m, m_pct, "Growth Score")
 
     valuation_comp = 0.0
     pe_val = u_details.get('pe')
@@ -842,8 +919,9 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
     values = [valuation_comp, profitability_comp, growth_comp, balance_comp, moat_comp]
     radar_plot(ax_radar, labels, values, title="Strength Radar")
 
+    # FIX 4: Pass/Fail Language
     checklist = [
-        ("Price < Intrinsic", s['decisions']['undervalued_pass']),
+        ("Price < Model Value", s['decisions']['undervalued_pass']),
         ("Debt/Equity < 0.5", (u_details.get('debtToEquity') is not None and u_details.get('debtToEquity') < 0.5)),
         ("ROE > 15%", (u_details.get('roe') is not None and u_details.get('roe') > 0.15)),
         ("Rev growth > 5%", (u_details.get('revenueGrowth') is not None and u_details.get('revenueGrowth') > 0.05)),
@@ -985,10 +1063,18 @@ with st.sidebar:
             st.warning("Install 'reportlab' to enable PDF export.")
 
     st.markdown("---")
+    # FIX 2 & 5: Strengthen Disclaimer & No Personalization
+    st.markdown("""
+    <div style='font-size: 11px; color: #888; line-height: 1.4;'>
+    <strong>Legal Disclaimer</strong><br>
+    This platform provides automated financial analysis and valuation tools for educational and informational purposes only. It does not constitute investment advice, financial advice, or a recommendation to buy, sell, or hold any security.<br><br>
+    All outputs are generated algorithmically based on publicly available data and user-defined assumptions. No representation is made regarding accuracy, completeness, or future performance. Users are solely responsible for their investment decisions.<br><br>
+    This platform does not provide personalized or suitability-based recommendations.
+    </div>
+    """, unsafe_allow_html=True)
     st.markdown(
         """<div style='text-align: center; color: #6B7280; font-size: 12px; margin-top: 10px;'>
             Developed by<br><strong style='color: #81C784; font-size: 14px;'>Sai Advaith Parimisetti</strong>
-            <br><br><em style='font-size: 10px;'>Disclaimer: This tool is for educational purposes only and does not constitute financial advice.</em>
         </div>""", unsafe_allow_html=True)
 
 # --- APP LOGIC ---
@@ -1033,9 +1119,11 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
     with col2:
         st.metric('📈 Market Cap', human_readable_marketcap(disp_mcap, disp_ccy))
     with col3:
-        st.metric('🎯 Undervalued', f"{summary['undervalued_score']}/40")
+        # FIX 1: Recommendation Language (Value Score)
+        st.metric('🎯 Value Score', f"{summary['undervalued_score']}/40")
     with col4:
-        st.metric('🚀 Multibagger', f"{summary['multibagger_score']}/50")
+        # FIX 1: Recommendation Language (Growth Score)
+        st.metric('🚀 Growth Score', f"{summary['multibagger_score']}/50")
 
     st.markdown('')
     
@@ -1061,9 +1149,9 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             with col_d2:
                 st.download_button('📥 Download High-Resolution Report', data=img, file_name=fn, mime='image/png', use_container_width=True)
 
-    # 2. INTRINSIC VALUE (FULLY AUTOMATED 3-WAY MODEL WITH CHARTS)
+    # 2. INTRINSIC VALUE (INSTITUTIONAL UPGRADE 5.0: FINAL POLISH & NARRATIVE)
     with tab2:
-        st.markdown('<h3 style="color:#1B4D2B;">Institutional Valuation (DCF)</h3>', unsafe_allow_html=True)
+        st.markdown('<h3 style="color:#1B4D2B;">Institutional Valuation (DCF) - Conservative Framework</h3>', unsafe_allow_html=True)
         
         # 1. FETCH DATA REQUIRED FOR ALL MODELS
         fcf_available = False
@@ -1088,64 +1176,148 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             else:
                 calc_fcf = latest_fcf
 
-            # 2. PERFORM AUTO CALCULATIONS
-            wacc, wacc_details = calculate_wacc_auto(yf_obj.info, fin, bs)
-            auto_growth = calculate_auto_growth(yf_obj.info)
-            perp_growth = 0.025
+            # FIX 1: Normalize Starting FCF
+            normalized_starting_fcf = calculate_normalized_fcf(yf_obj, calc_fcf)
 
-            # Common Projections
-            future_fcf = [calc_fcf * ((1 + auto_growth) ** i) for i in range(1, 6)]
-            discount_factors = [1 / ((1 + wacc) ** i) for i in range(1, 6)]
+            # 2. PERFORM DUAL CALCULATIONS (Base vs Stress)
+            wacc_base, wacc_stress, wacc_details = calculate_wacc_institutional(yf_obj.info, fin, bs)
+            
+            # Growth Inputs
+            explicit_growth = calculate_auto_growth(yf_obj.info)
+            terminal_growth = 0.025 # GDP Capped
+            
+            # POLISH 1: Calculate Implied Reinvestment & ROIC
+            payout = yf_obj.info.get('payoutRatio', 0.0)
+            if payout is None: payout = 0.0
+            
+            # Reinvestment Rate = 1 - Payout Ratio.
+            # We enforce a floor of 5% reinvestment to avoid division by zero errors in high payout scenarios
+            implied_reinvestment = max(0.05, 1 - payout) 
+            
+            # Implied ROIC = Growth / Reinvestment Rate
+            # This checks: "Is the growth realistic given how much they are reinvesting?"
+            implied_roic = explicit_growth / implied_reinvestment
+
+            # FIX 2: Slower Fade (10 Years)
+            future_fcf = []
+            current_val = normalized_starting_fcf
+            
+            # Years 1-5 (Explicit)
+            for i in range(1, 6):
+                current_val = current_val * (1 + explicit_growth)
+                future_fcf.append(current_val)
+                
+            # Years 6-10 (Slower Fade to Bridge)
+            fade_target = max(terminal_growth, explicit_growth * 0.5) 
+            growth_decay = (explicit_growth - fade_target) / 5
+            current_growth = explicit_growth
+            
+            for i in range(6, 11):
+                current_growth -= growth_decay
+                current_val = current_val * (1 + current_growth)
+                future_fcf.append(current_val)
+            
+            # Discounting (10 Years) using BASE WACC
+            discount_factors = [1 / ((1 + wacc_base) ** i) for i in range(1, 11)]
             dcf_vals = [f * d for f, d in zip(future_fcf, discount_factors)]
             sum_pv_fcf = sum(dcf_vals)
 
             # --- SUB TABS ---
             subtab_auto, subtab_sens, subtab_exit = st.tabs(["🤖 Auto-WACC & Growth", "🌡️ Sensitivity Matrix", "🚪 Exit Multiple"])
 
-            # A. AUTO-ASSISTED DCF
+            # -----------------------------------------------------------
+            # CALCULATIONS HOISTED TO MAIN SCOPE FOR NARRATIVE GENERATION
+            # -----------------------------------------------------------
+            
+            # A. DCF (Base Case)
+            tv_perp = (future_fcf[-1] * (1 + terminal_growth)) / (wacc_base - terminal_growth)
+            pv_tv_perp = tv_perp / ((1 + wacc_base) ** 10)
+            equity_val_perp = sum_pv_fcf + pv_tv_perp
+            share_price_perp = equity_val_perp / shares
+            upside_perp = (share_price_perp - disp_price) / disp_price
+
+            # B. Exit Multiple (Base Case)
+            ebitda = 0
+            if 'EBITDA' in fin.index: ebitda = fin.loc['EBITDA'].iloc[0]
+            share_price_exit = 0
+            
+            if ebitda > 0:
+                ebitda_y10 = ebitda
+                current_g_exit = explicit_growth
+                decay_exit = (explicit_growth - fade_target) / 5
+                for _ in range(5): ebitda_y10 *= (1 + explicit_growth)
+                for _ in range(5): 
+                    current_g_exit -= decay_exit
+                    ebitda_y10 *= (1 + current_g_exit)
+                
+                sector = summary.get('sector', 'Technology')
+                base_pe = SECTOR_PE_MAP.get(sector, 20)
+                sector_mult = max(10, min(base_pe, 30))
+                
+                tv_exit = ebitda_y10 * sector_mult
+                pv_tv_exit = tv_exit / ((1 + wacc_base) ** 10)
+                equity_val_exit = sum_pv_fcf + pv_tv_exit
+                share_price_exit = equity_val_exit / shares
+            
+            # C. Stress Case DCF
+            tv_stress = (future_fcf[-1] * (1 + terminal_growth)) / (wacc_stress - terminal_growth)
+            pv_tv_stress = tv_stress / ((1 + wacc_stress) ** 10)
+            stress_dcf_vals = [f * (1/((1+wacc_stress)**(i+1))) for i, f in enumerate(future_fcf)]
+            share_price_stress = (sum(stress_dcf_vals) + pv_tv_stress) / shares
+
+            # POLISH 2: Valuation Narrative
+            narrative = ""
+            if share_price_exit > share_price_perp * 1.3:
+                narrative = f"**Insight:** The Market-Implied Value ({human_readable_price(share_price_exit, disp_ccy)}) is significantly higher than the Conservative DCF. This suggests the market is pricing in a 'longer moat' (slower fade) or higher terminal margins than our base case assumes."
+            elif share_price_perp > share_price_exit * 1.1:
+                narrative = f"**Insight:** The Conservative DCF ({human_readable_price(share_price_perp, disp_ccy)}) is notably higher than the Exit Multiple valuation. This implies the stock may be fundamentally undervalued even if market multiples compress."
+            else:
+                narrative = "**Insight:** Both valuation methods (DCF & Exit Multiple) are converging, suggesting the current valuation is well-supported by both fundamental cash flows and market comparables."
+
+            # A. AUTO-ASSISTED DCF DISPLAY
             with subtab_auto:
-                st.markdown(f"##### 🤖 Automated Discounted Cash Flow (Perpetual Growth)")
-                st.caption(f"Based on computed WACC: **{wacc:.1%}** and Sustainable Growth: **{auto_growth:.1%}**.")
-                
-                # Terminal Value
-                tv_perp = (future_fcf[-1] * (1 + perp_growth)) / (wacc - perp_growth)
-                pv_tv_perp = tv_perp / ((1 + wacc) ** 5)
-                equity_val_perp = sum_pv_fcf + pv_tv_perp
-                share_price_perp = equity_val_perp / shares
-                
-                upside = (share_price_perp - disp_price) / disp_price
+                st.markdown(f"##### 🤖 Institutional DCF Model (Conservative Base Case)")
+                st.caption(f"Valuation using **Base WACC ({wacc_base:.1%})** and **Normalized Cash Flows**.")
                 
                 c_main1, c_main2 = st.columns([1, 2])
                 with c_main1:
-                    st.metric("Intrinsic Value", human_readable_price(share_price_perp, disp_ccy), f"{upside*100:.1f}%")
+                    # FIX 3: "Intrinsic Value" -> "Model-Implied Intrinsic Value"
+                    st.metric("Model-Implied Intrinsic Value (Base)", human_readable_price(share_price_perp, disp_ccy), f"{upside_perp*100:.1f}%")
+                    st.caption(f"Downside (Stress Case): {human_readable_price(share_price_stress, disp_ccy)}")
                 with c_main2:
+                    # ROIC Logic for display
+                    roic_color = "green" if implied_roic > wacc_base else "red"
+                    roic_msg = "Value Creation" if implied_roic > wacc_base else "Value Destruction"
+                    
                     st.info(f"""
-                    **Model Inputs (Automated):**
-                    - Cost of Equity: {wacc_details['Cost of Equity']:.1%} (Risk Free: {wacc_details['Risk Free Rate']:.1%} + Beta: {wacc_details['Beta']:.2f})
-                    - Cost of Debt: {wacc_details['Cost of Debt (Pre-Tax)']:.1%} (After Tax)
-                    - WACC: {wacc:.1%}
+                    **Economic Reality Check:**
+                    - **Implied ROIC**: :{roic_color}[**{implied_roic:.1%}**] vs WACC {wacc_base:.1%} ({roic_msg})
+                    - **Reinvestment Rate**: {implied_reinvestment:.1%} of earnings retained.
+                    - **Growth Fade**: {explicit_growth:.1%} (5Y) → {fade_target:.1%} (10Y)
                     """)
+                
+                st.markdown(f"> {narrative}")
                 
                 # SAVE DCF DATA FOR EXPORT
                 st.session_state['dcf_data'] = {
                     "intrinsic_value": human_readable_price(share_price_perp, disp_ccy),
-                    "upside": f"{upside*100:.2f}%",
-                    "wacc": f"{wacc:.2%}",
-                    "growth_rate": f"{auto_growth:.2%}",
-                    "fcf_start": f"{calc_fcf:,.2f}"
+                    "upside": f"{upside_perp*100:.2f}%",
+                    "wacc": f"{wacc_base:.2%}",
+                    "growth_rate": f"{explicit_growth:.2%}",
+                    "fcf_start": f"{normalized_starting_fcf:,.2f}"
                 }
 
                 # NEW CHART: Valuation Bridge (Waterfall)
                 bridge_data = pd.DataFrame({
-                    "Component": ["PV of Cash Flows (1-5Y)", "PV of Terminal Value", "Total Equity Value"],
+                    "Component": ["PV of Cash Flows (1-10Y)", "PV of Terminal Value", "Total Equity Value"],
                     "Value": [sum_pv_fcf, pv_tv_perp, equity_val_perp]
                 })
-                # Prepare data for PDF capture (labels and raw values)
+                
                 if st.session_state.get('dcf_charts_data') is None:
                     st.session_state['dcf_charts_data'] = {}
                 
                 st.session_state['dcf_charts_data']['waterfall'] = {
-                    'labels': ["PV of Cash Flows", "Terminal Value", "Total Equity"],
+                    'labels': ["PV of Cash Flows (1-10Y)", "Terminal Value (PV)", "Total Equity"],
                     'values': [sum_pv_fcf, pv_tv_perp, equity_val_perp]
                 }
 
@@ -1161,11 +1333,11 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
 
             # B. SENSITIVITY ANALYSIS
             with subtab_sens:
-                st.markdown("##### 🌡️ Valuation Heatmap (Banker's View)")
-                st.caption("Valuation range based on different WACC and Terminal Growth assumptions.")
+                st.markdown("##### 🌡️ Valuation Heatmap (Base WACC Center)")
+                st.caption("Sensitivity of Intrinsic Value to long-term economic assumptions.")
                 
-                wacc_range = [wacc - 0.01, wacc - 0.005, wacc, wacc + 0.005, wacc + 0.01]
-                growth_range = [perp_growth - 0.01, perp_growth - 0.005, perp_growth, perp_growth + 0.005, perp_growth + 0.01]
+                wacc_range = [wacc_base - 0.01, wacc_base - 0.005, wacc_base, wacc_base + 0.005, wacc_base + 0.01]
+                growth_range = [0.015, 0.020, 0.025, 0.030, 0.035]
                 
                 data = []
                 for w in wacc_range:
@@ -1173,13 +1345,14 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     for g in growth_range:
                         if w <= g: val = 0 
                         else:
-                            tv = (future_fcf[-1] * (1 + g)) / (w - g)
-                            pv_tv = tv / ((1 + w) ** 5)
-                            val = (sum_pv_fcf + pv_tv) / shares
+                            cell_tv = (future_fcf[-1] * (1 + g)) / (w - g)
+                            cell_pv_tv = cell_tv / ((1 + w) ** 10)
+                            cell_dcf_vals = [f * (1/((1+w)**(i+1))) for i, f in enumerate(future_fcf)]
+                            cell_sum_pv = sum(cell_dcf_vals)
+                            val = (cell_sum_pv + cell_pv_tv) / shares
                         row.append(val)
                     data.append(row)
                 
-                # Capture Sensitivity Data for PDF
                 if st.session_state.get('dcf_charts_data'):
                     st.session_state['dcf_charts_data']['sensitivity'] = {
                         'matrix': pd.DataFrame(data, index=[f"{w:.1%}" for w in wacc_range], columns=[f"{g:.1%}" for g in growth_range]),
@@ -1187,12 +1360,9 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                         'cols': growth_range
                     }
 
-                # 1. Styled DataFrame (FIXED FORMATTING using Lambda)
                 df_sens = pd.DataFrame(data, index=[f"WACC {w:.1%}" for w in wacc_range], columns=[f"Term Growth {g:.1%}" for g in growth_range])
-                # Using a lambda to ensure strict string formatting
                 st.dataframe(df_sens.style.format(lambda x: f"{_get_currency_symbol(disp_ccy)}{x:,.2f}").background_gradient(cmap='RdYlGn', axis=None), use_container_width=True)
 
-                # 2. NEW CHART: Interactive 3D Surface/Heatmap
                 fig_heat = go.Figure(data=go.Heatmap(
                     z=data,
                     x=[f"{g:.1%}" for g in growth_range],
@@ -1201,37 +1371,27 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     texttemplate="%{z:.0f}",
                     hoverongaps=False
                 ))
-                fig_heat.update_layout(title="Sensitivity Heatmap (Interactive)", xaxis_title="Terminal Growth", yaxis_title="WACC", template="plotly_dark", height=400)
+                fig_heat.update_layout(title="Sensitivity Heatmap (Interactive)", xaxis_title="Terminal Growth (GDP Linked)", yaxis_title="WACC", template="plotly_dark", height=400)
                 st.plotly_chart(fig_heat, use_container_width=True)
 
-            # C. EXIT MULTIPLE METHOD
+            # C. EXIT MULTIPLE
             with subtab_exit:
-                st.markdown("##### 🚪 Exit Multiple Method (Private Equity Style)")
-                st.caption("Valuation assuming sale at a multiple of EBITDA in Year 5.")
-                
-                ebitda = 0
-                if 'EBITDA' in fin.index:
-                    ebitda = fin.loc['EBITDA'].iloc[0]
+                st.markdown("##### 🚪 Market-Implied Value (Exit Multiple)")
+                st.caption("Valuation assuming sale at a dynamic sector-based multiple.")
                 
                 if ebitda > 0:
-                    ebitda_y5 = ebitda * ((1 + auto_growth) ** 5)
-                    sector_mult = 12.0 
-                    tv_exit = ebitda_y5 * sector_mult
-                    pv_tv_exit = tv_exit / ((1 + wacc) ** 5)
-                    equity_val_exit = sum_pv_fcf + pv_tv_exit
-                    share_price_exit = equity_val_exit / shares
                     upside_exit = (share_price_exit - disp_price) / disp_price
                     
                     c_ex1, c_ex2 = st.columns(2)
                     with c_ex1:
-                        st.metric("Intrinsic Value (Exit Multiple)", human_readable_price(share_price_exit, disp_ccy), f"{upside_exit*100:.1f}%")
+                        # FIX 3: "Intrinsic Value" -> "Model-Implied Value"
+                        st.metric("Market-Implied Value", human_readable_price(share_price_exit, disp_ccy), f"{upside_exit*100:.1f}%")
                     with c_ex2:
-                        st.write(f"Assumed Exit Multiple: **{sector_mult}x EBITDA**")
-                        st.write(f"Projected Year 5 EBITDA: {human_readable_generic(ebitda_y5, disp_ccy)}")
+                        st.write(f"Assumed Exit Multiple: **{sector_mult}x**")
+                        st.write(f"Projected Year 10 EBITDA: {human_readable_generic(ebitda_y10, disp_ccy)}")
                         
-                    # NEW CHART: Methodology Face-off
                     comp_df = pd.DataFrame({
-                        "Method": ["Perpetual Growth", "Exit Multiple"],
+                        "Method": ["Conservative DCF", "Market-Implied Value"],
                         "Share Price": [share_price_perp, share_price_exit]
                     })
                     fig_comp = go.Figure(go.Bar(
@@ -1569,4 +1729,3 @@ else:
             <p style="color:#6B7280; margin:0; font-size:14px; line-height:1.6;">Start by entering a stock ticker in the sidebar.</p>
         </div>
         ''', unsafe_allow_html=True)
-
