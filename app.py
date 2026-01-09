@@ -172,15 +172,46 @@ def get_yf_ticker_variants(base_ticker, country_code):
 def fetch_info_with_variants(base_ticker, country_code):
     tried = []
     variants = get_yf_ticker_variants(base_ticker, country_code)
+    
     for variant in variants:
         try:
             t = yf.Ticker(variant)
-            info = t.info
-            if info and (info.get("regularMarketPrice") is not None or info.get("symbol") or info.get("shortName")):
-                return info, variant
+            
+            # ATTEMPT 1: Standard info fetch (often rate-limited on Cloud)
+            try:
+                info = t.info
+                # Check for critical data
+                if info and info.get("regularMarketPrice") is not None:
+                    return info, variant
+            except:
+                info = {}
+
+            # ATTEMPT 2: Fallback to fast_info (API-based, more robust)
+            # If standard info failed or returned None, try fast_info
+            if not info or info.get("regularMarketPrice") is None:
+                fast = t.fast_info
+                if fast and hasattr(fast, 'last_price') and fast.last_price is not None:
+                    # Reconstruct a minimal info dict
+                    info = {
+                        "regularMarketPrice": fast.last_price,
+                        "marketCap": fast.market_cap,
+                        "currency": fast.currency,
+                        "symbol": variant,
+                        "shortName": variant, # Fallback
+                        "longName": variant,  # Fallback
+                        "sector": "Unknown",  # Cannot fetch via fast_info
+                        "industry": "Unknown",
+                        "beta": 1.0,          # Conservative default
+                        "trailingPE": None,
+                        "returnOnEquity": 0.15 # Conservative default for models
+                    }
+                    return info, variant
+                    
+            tried.append(variant)
         except Exception:
             tried.append(variant)
-    raise RuntimeError(f"No usable yfinance data found. Tried: {variants}")
+            
+    raise RuntimeError(f"No usable yfinance data found. Tried: {tried}")
 
 def fetch_screener_in(ticker_base):
     try:
