@@ -169,30 +169,19 @@ def get_yf_ticker_variants(base_ticker, country_code):
     return out
 
 @st.cache_data(ttl=3600, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def fetch_info_with_variants(base_ticker, country_code):
+    tried = []
     variants = get_yf_ticker_variants(base_ticker, country_code)
-
     for variant in variants:
         try:
             t = yf.Ticker(variant)
-
-            # 1. Try fast_info (most reliable now)
-            fast = getattr(t, "fast_info", {})
-            if fast and fast.get("last_price"):
-                return t.info or {}, variant
-
-            # 2. Try history fallback
-            hist = t.history(period="5d")
-            if hist is not None and not hist.empty:
-                return t.info or {}, variant
-
+            info = t.info
+            if info and (info.get("regularMarketPrice") is not None or info.get("symbol") or info.get("shortName")):
+                return info, variant
         except Exception:
-            continue
-
-    raise RuntimeError(
-        f"No usable yfinance data found. Tried: {variants}"
-    )
-
+            tried.append(variant)
+    raise RuntimeError(f"No usable yfinance data found. Tried: {variants}")
 
 def fetch_screener_in(ticker_base):
     try:
@@ -1741,3 +1730,4 @@ else:
             <p style="color:#6B7280; margin:0; font-size:14px; line-height:1.6;">Start by entering a stock ticker in the sidebar.</p>
         </div>
         ''', unsafe_allow_html=True)
+
