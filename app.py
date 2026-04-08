@@ -1187,7 +1187,18 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
         # 1. FETCH DATA REQUIRED FOR ALL MODELS
         fcf_available = False
         latest_fcf = 0
-        shares = yf_obj.info.get('sharesOutstanding')
+        
+        # FIX: Use the already fetched info to prevent rate limits
+        fetched_info = summary.get('fetched_info', {})
+        shares = fetched_info.get('sharesOutstanding')
+        
+        # Fallback: Calculate implied shares if using fast_info
+        if not shares:
+            mcap = summary.get('marketCap')
+            current_price = summary.get('price')
+            if mcap and current_price and current_price > 0:
+                shares = mcap / current_price
+                
         try:
             cf = yf_obj.cashflow
             bs = yf_obj.balance_sheet
@@ -1211,14 +1222,14 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             normalized_starting_fcf = calculate_normalized_fcf(yf_obj, calc_fcf)
 
             # 2. PERFORM DUAL CALCULATIONS (Base vs Stress)
-            wacc_base, wacc_stress, wacc_details = calculate_wacc_institutional(yf_obj.info, fin, bs)
+            wacc_base, wacc_stress, wacc_details = calculate_wacc_institutional(fetched_info, fin, bs)
             
             # Growth Inputs
-            explicit_growth = calculate_auto_growth(yf_obj.info)
+            explicit_growth = calculate_auto_growth(fetched_info)
             terminal_growth = 0.025 # GDP Capped
             
             # POLISH 1: Calculate Implied Reinvestment & ROIC
-            payout = yf_obj.info.get('payoutRatio', 0.0)
+            payout = fetched_info.get('payoutRatio', 0.0)
             if payout is None: payout = 0.0
             
             # Reinvestment Rate = 1 - Payout Ratio.
