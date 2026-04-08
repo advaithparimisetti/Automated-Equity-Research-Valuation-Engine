@@ -15,7 +15,7 @@ import io
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import concurrent.futures
-api_key = "26cQYurBS4stKbDAjsvlfekCqWSTFBTy"
+
 # PDF Report Generation Imports
 try:
     from reportlab.lib.pagesizes import letter
