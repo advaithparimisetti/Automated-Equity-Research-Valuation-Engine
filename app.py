@@ -3,7 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timezone
 import traceback
 # THREAD SAFETY FIX: Import Figure directly
 from matplotlib.figure import Figure 
@@ -15,7 +15,7 @@ import io
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import concurrent.futures
-
+api_key = "26cQYurBS4stKbDAjsvlfekCqWSTFBTy"
 # PDF Report Generation Imports
 try:
     from reportlab.lib.pagesizes import letter
@@ -294,22 +294,29 @@ def fetch_info_with_variants(base_ticker, country_code, api_key):
         try:
             prof_url = f"https://financialmodelingprep.com/api/v3/profile/{variant}?apikey={api_key}"
             prof_res = requests.get(prof_url).json()
-            if prof_res:
+            
+            # Check if API returned an error message (e.g., Invalid Key or Limit Reached)
+            if isinstance(prof_res, dict) and "Error Message" in prof_res:
+                st.error(f"FMP API Error: {prof_res['Error Message']}")
+                return {}, variant
+                
+            if prof_res and isinstance(prof_res, list):
                 prof = prof_res[0]
+                
                 # Key metrics
                 km_url = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{variant}?apikey={api_key}"
                 km_res = requests.get(km_url).json()
-                km = km_res[0] if km_res else {}
+                km = km_res[0] if km_res and isinstance(km_res, list) else {}
                 
-                # Rating
+                # Rating (Safe Fetch)
                 rating_url = f"https://financialmodelingprep.com/api/v3/rating/{variant}?apikey={api_key}"
                 rating_res = requests.get(rating_url).json()
-                rating = rating_res[0] if rating_res else {}
+                rating = rating_res[0] if rating_res and isinstance(rating_res, list) else {}
 
-                # Target
-                tgt_url = f"https://financialmodelingprep.com/api/v4/price-target-consensus?symbol={variant}?apikey={api_key}"
+                # Target (Safe Fetch + Fixed URL typo '&apikey')
+                tgt_url = f"https://financialmodelingprep.com/api/v4/price-target-consensus?symbol={variant}&apikey={api_key}"
                 tgt_res = requests.get(tgt_url).json()
-                tgt = tgt_res[0] if tgt_res else {}
+                tgt = tgt_res[0] if tgt_res and isinstance(tgt_res, list) else {}
 
                 info = {
                     "regularMarketPrice": prof.get("price"),
@@ -328,7 +335,7 @@ def fetch_info_with_variants(base_ticker, country_code, api_key):
                     "returnOnInvestment": km.get("roicTTM"),
                     "debtToEquity": km.get("debtToEquityTTM"),
                     "dividendYield": km.get("dividendYieldPercentageTTM") / 100 if km.get("dividendYieldPercentageTTM") else 0,
-                    "revenueGrowth": km.get("revenuePerShareTTM"), # Proxy
+                    "revenueGrowth": km.get("revenuePerShareTTM"), 
                     "payoutRatio": km.get("payoutRatioTTM"),
                     "sharesOutstanding": prof.get("mktCap") / prof.get("price") if prof.get("price") and prof.get("mktCap") else None,
                     "fullTimeEmployees": prof.get("fullTimeEmployees"),
@@ -341,7 +348,7 @@ def fetch_info_with_variants(base_ticker, country_code, api_key):
                 }
                 return info, variant
             tried.append(variant)
-        except Exception:
+        except Exception as e:
             tried.append(variant)
             
     raise RuntimeError(f"No usable data found on FMP. Tried: {tried}")
@@ -375,7 +382,7 @@ def fetch_news_fallback(ticker):
         }
         r = requests.get(url, headers=headers, timeout=5)
         soup = BeautifulSoup(r.content, features="xml")
-        items = soup.findAll('item')
+        items = soup.find_all('item')
         for item in items[:5]: 
             try:
                 title = item.title.text if item.title else "No Title"
@@ -630,7 +637,7 @@ def run_playbook_for_ticker(ticker_input, country_code="", api_key=""):
         "multibagger_details": m_details,
         "decisions": {"undervalued_pass": u_score >= 25, "multibagger_pass": m_score >= 30},
         "fetched_info": info,
-        "as_of": datetime.utcnow().isoformat() + "Z"
+        "as_of": datetime.now(timezone.utc).isoformat() + "Z"
     }
     return summary
 
@@ -1080,7 +1087,7 @@ with st.sidebar:
     use_usd = st.checkbox("Convert to USD", value=False)
     
     st.markdown('---')
-    run_btn = st.button('▶ Generate Research Report', type='primary', use_container_width=True)
+    run_btn = st.button('▶ Generate Research Report', type='primary', width="stretch")
     
     if st.session_state.get('analysis_done', False):
         st.markdown("### 📥 Export Hub")
@@ -1111,12 +1118,12 @@ with st.sidebar:
                         sheet.column_dimensions[column[0].column_letter].width = max_length + 2
 
             output.seek(0)
-            st.download_button('📥 Download Full Excel', data=output, file_name=f"{summ['ticker_used']}_full_report.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
+            st.download_button('📥 Download Full Excel', data=output, file_name=f"{summ['ticker_used']}_full_report.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', width="stretch")
         except Exception as e:
             st.warning("Export requires 'openpyxl'. Please install it.")
 
         if REPORTLAB_AVAILABLE:
-            if st.button("📄 Generate PDF Report", use_container_width=True):
+            if st.button("📄 Generate PDF Report", width="stretch"):
                 pdf_data = generate_comprehensive_pdf(
                     st.session_state['summary'], 
                     st.session_state.get('dcf_data'), 
@@ -1125,7 +1132,7 @@ with st.sidebar:
                     st.session_state.get('fig_risk'),
                     st.session_state.get('dcf_charts_data') 
                 )
-                st.download_button("⬇️ Download PDF", pdf_data, f"{st.session_state['summary']['ticker_used']}_Report.pdf", "application/pdf", use_container_width=True)
+                st.download_button("⬇️ Download PDF", pdf_data, f"{st.session_state['summary']['ticker_used']}_Report.pdf", "application/pdf", width="stretch")
         else:
             st.warning("Install 'reportlab' to enable PDF export.")
 
@@ -1203,7 +1210,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
         st.markdown('<h3 style="color:#1B4D2B;">Visual Analysis Report</h3>', unsafe_allow_html=True)
         fig = render_infographic(summary, convert_usd=using_usd, rate=rate, api_key=fmp_key)
         if fig:
-            st.pyplot(fig, use_container_width=True)
+            st.pyplot(fig, width="stretch")
             st.session_state['fig_visual'] = fig 
             
             fn = f"{summary['ticker_used']}_equity_research.png"
@@ -1214,7 +1221,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             st.markdown('<hr>', unsafe_allow_html=True)
             col_d1, col_d2, col_d3 = st.columns([1,1.5,1])
             with col_d2:
-                st.download_button('📥 Download High-Resolution Report', data=img, file_name=fn, mime='image/png', use_container_width=True)
+                st.download_button('📥 Download High-Resolution Report', data=img, file_name=fn, mime='image/png', width="stretch")
 
     # 2. INTRINSIC VALUE 
     with tab2:
@@ -1374,7 +1381,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     textposition='auto'
                 ))
                 fig_bridge.update_layout(title="Valuation Bridge: Where does the value come from?", template="plotly_dark", height=400, margin=dict(l=0, r=0, t=40, b=0))
-                st.plotly_chart(fig_bridge, use_container_width=True)
+                st.plotly_chart(fig_bridge, width="stretch")
 
             with subtab_sens:
                 st.markdown("##### 🌡️ Valuation Heatmap (Base WACC Center)")
@@ -1405,7 +1412,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     }
 
                 df_sens = pd.DataFrame(data, index=[f"WACC {w:.1%}" for w in wacc_range], columns=[f"Term Growth {g:.1%}" for g in growth_range])
-                st.dataframe(df_sens.style.format(lambda x: f"{_get_currency_symbol(disp_ccy)}{x:,.2f}").background_gradient(cmap='RdYlGn', axis=None), use_container_width=True)
+                st.dataframe(df_sens.style.format(lambda x: f"{_get_currency_symbol(disp_ccy)}{x:,.2f}").background_gradient(cmap='RdYlGn', axis=None), width="stretch")
 
                 fig_heat = go.Figure(data=go.Heatmap(
                     z=data,
@@ -1416,7 +1423,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     hoverongaps=False
                 ))
                 fig_heat.update_layout(title="Sensitivity Heatmap (Interactive)", xaxis_title="Terminal Growth (GDP Linked)", yaxis_title="WACC", template="plotly_dark", height=400)
-                st.plotly_chart(fig_heat, use_container_width=True)
+                st.plotly_chart(fig_heat, width="stretch")
 
             with subtab_exit:
                 st.markdown("##### 🚪 Market-Implied Value (Exit Multiple)")
@@ -1445,7 +1452,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     ))
                     fig_comp.add_hline(y=disp_price, line_dash="dash", line_color="red", annotation_text="Current Price")
                     fig_comp.update_layout(title="Methodology Comparison", template="plotly_dark", height=400)
-                    st.plotly_chart(fig_comp, use_container_width=True)
+                    st.plotly_chart(fig_comp, width="stretch")
                     
                 else:
                     st.warning("Negative or missing EBITDA. Cannot perform Exit Multiple analysis.")
@@ -1563,7 +1570,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     fig_plotly.add_trace(go.Bar(x=hist.index, y=hist_macd, marker_color='gray', name='Hist'), row=2, col=1)
 
                 fig_plotly.update_layout(template='plotly_dark', height=700, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=30, b=0))
-                st.plotly_chart(fig_plotly, use_container_width=True)
+                st.plotly_chart(fig_plotly, width="stretch")
             else:
                 st.warning("No price history available.")
         except Exception as e:
@@ -1592,11 +1599,11 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             fin_type = st.selectbox("Select Statement", ["Income Statement", "Balance Sheet", "Cash Flow"])
             try:
                 if fin_type == "Income Statement": 
-                    st.dataframe(clean_financial_df(fmp_obj.financials), use_container_width=True)
+                    st.dataframe(clean_financial_df(fmp_obj.financials), width="stretch")
                 elif fin_type == "Balance Sheet": 
-                    st.dataframe(clean_financial_df(fmp_obj.balance_sheet), use_container_width=True)
+                    st.dataframe(clean_financial_df(fmp_obj.balance_sheet), width="stretch")
                 elif fin_type == "Cash Flow": 
-                    st.dataframe(clean_financial_df(fmp_obj.cashflow), use_container_width=True)
+                    st.dataframe(clean_financial_df(fmp_obj.cashflow), width="stretch")
             except: st.warning("Financial data unavailable.")
 
         with subtab_rec:
@@ -1631,7 +1638,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                         }
                     ))
                     fig_gauge.update_layout(paper_bgcolor = "rgba(0,0,0,0)", font = {'color': "white", 'family': "Inter"}, height=350, margin=dict(l=30, r=30, t=80, b=20))
-                    st.plotly_chart(fig_gauge, use_container_width=True)
+                    st.plotly_chart(fig_gauge, width="stretch")
 
                 with col_text:
                     st.markdown(f"""
@@ -1720,7 +1727,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
 
             if comparison_data:
                 comp_df = pd.DataFrame(comparison_data).set_index("Ticker").transpose()
-                st.dataframe(comp_df, use_container_width=True)
+                st.dataframe(comp_df, width="stretch")
             else:
                 st.warning("No data found for peers.")
 
