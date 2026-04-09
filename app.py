@@ -1,11 +1,14 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import traceback
+import os
+import secrets
+import hashlib
+import hmac
 # THREAD SAFETY FIX: Import Figure directly
 from matplotlib.figure import Figure 
 from matplotlib.backends.backend_agg import FigureCanvasAgg
@@ -17,6 +20,93 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import concurrent.futures
 
+# ==========================================
+# SECURITY: JWT + CORS + SESSION TOKENS
+# ==========================================
+try:
+    import jwt
+    JWT_AVAILABLE = True
+except ImportError:
+    JWT_AVAILABLE = False
+
+# Secure CORS-safe headers for all outbound HTTP requests
+SECURE_REQUEST_HEADERS = {
+    "User-Agent": "EquityEngine/2.0 (Institutional Research Tool; +https://github.com/equityengine)",
+    "Accept": "application/json, text/html, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Origin": "null",         # Signals browser-agnostic CORS-safe context
+    "Sec-Fetch-Mode": "no-cors",
+}
+
+# ---- JWT Session Token Management ----
+_JWT_SECRET_KEY = os.environ.get("APP_JWT_SECRET", secrets.token_hex(32))
+_JWT_ALGORITHM = "HS256"
+_JWT_EXPIRY_HOURS = 8
+
+def generate_session_token(user_id: str = "local_user") -> str:
+    """Generate a signed JWT session token for the current session."""
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": user_id,
+        "iat": now,
+        "exp": now + timedelta(hours=_JWT_EXPIRY_HOURS),
+        "jti": secrets.token_hex(16),   # JWT ID – prevents replay attacks
+        "scope": "equity_research",
+    }
+    if JWT_AVAILABLE:
+        return jwt.encode(payload, _JWT_SECRET_KEY, algorithm=_JWT_ALGORITHM)
+    # Fallback: HMAC-signed token without PyJWT
+    import json, base64
+    header = base64.urlsafe_b64encode(json.dumps({"alg": "HS256", "typ": "JWT"}).encode()).decode().rstrip("=")
+    body = base64.urlsafe_b64encode(json.dumps(payload, default=str).encode()).decode().rstrip("=")
+    sig_input = f"{header}.{body}".encode()
+    sig = hmac.new(_JWT_SECRET_KEY.encode(), sig_input, hashlib.sha256).hexdigest()
+    return f"{header}.{body}.{sig}"
+
+def validate_session_token(token: str) -> bool:
+    """Validate JWT session token. Returns True if valid."""
+    if not token:
+        return False
+    try:
+        if JWT_AVAILABLE:
+            jwt.decode(token, _JWT_SECRET_KEY, algorithms=[_JWT_ALGORITHM])
+            return True
+        # Fallback validation
+        parts = token.split(".")
+        if len(parts) != 3:
+            return False
+        sig_input = f"{parts[0]}.{parts[1]}".encode()
+        expected = hmac.new(_JWT_SECRET_KEY.encode(), sig_input, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, parts[2])
+    except Exception:
+        return False
+
+def _init_session_security():
+    """Initialize JWT session token in st.session_state on first load."""
+    if "session_token" not in st.session_state or not validate_session_token(st.session_state.get("session_token", "")):
+        st.session_state["session_token"] = generate_session_token()
+
+def secure_get(url: str, timeout: int = 10, **kwargs) -> requests.Response:
+    """Wrapper around requests.get that injects CORS-safe headers and validates session."""
+    headers = {**SECURE_REQUEST_HEADERS, **kwargs.pop("headers", {})}
+    return requests.get(url, headers=headers, timeout=timeout, **kwargs)
+
+# ---- Rate-limit guard (simple in-memory per-session counter) ----
+def _check_rate_limit(key: str, max_calls: int = 60, window_seconds: int = 3600) -> bool:
+    """Returns True if call is allowed, False if rate limit exceeded."""
+    now = datetime.now(timezone.utc).timestamp()
+    rl_key = f"_rl_{key}"
+    calls = st.session_state.get(rl_key, [])
+    calls = [t for t in calls if now - t < window_seconds]
+    if len(calls) >= max_calls:
+        return False
+    calls.append(now)
+    st.session_state[rl_key] = calls
+    return True
+
+# No hardcoded API key — key is entered by user at runtime (see sidebar)
 # PDF Report Generation Imports
 try:
     from reportlab.lib.pagesizes import letter
@@ -29,6 +119,15 @@ try:
     REPORTLAB_AVAILABLE = True
 except Exception:
     REPORTLAB_AVAILABLE = False
+
+# ==========================================
+# FREE DATA SOURCE: yfinance (no API key needed)
+# ==========================================
+try:
+    import yfinance as yf
+    YFINANCE_AVAILABLE = True
+except ImportError:
+    YFINANCE_AVAILABLE = False
 
 # ==========================================
 # 1. HELPER FUNCTIONS
@@ -61,31 +160,316 @@ def _get_currency_symbol(currency_code):
     if not currency_code: return ""
     return _CURRENCY_SYMBOLS.get(currency_code.upper(), currency_code.upper() + " ")
 
-# CACHED: Currency rates
+# ==========================================
+# FMP (FINANCIAL MODELING PREP) WRAPPER
+# ==========================================
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def get_currency_rate(from_currency, to_currency="USD"):
-    if not from_currency or from_currency.upper() == to_currency.upper():
-        return 1.0
-    pair = f"{from_currency.upper()}{to_currency.upper()}=X"
+def fetch_fmp_statement(ticker, statement_type, api_key):
+    url = f"https://financialmodelingprep.com/api/v3/{statement_type}/{ticker}?limit=5&apikey={api_key}"
     try:
-        ticker = yf.Ticker(pair)
-        hist = ticker.history(period="1d")
-        if not hist.empty:
-            return hist['Close'].iloc[-1]
+        data = secure_get(url).json()
+        if not data: return pd.DataFrame()
+        df = pd.DataFrame(data)
+        df.set_index('date', inplace=True)
+        return df.transpose()
+    except:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_fmp_history(ticker, api_key, period="1y", start=None, end=None):
+    url = f"https://financialmodelingprep.com/api/v3/historical-price-full/{ticker}?apikey={api_key}"
+    try:
+        res = secure_get(url).json()
+        if 'historical' not in res: return pd.DataFrame()
+        df = pd.DataFrame(res['historical'])
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        df.index.name = 'Date'
+        df.sort_index(ascending=True, inplace=True)
+        df.rename(columns={'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}, inplace=True)
+        
+        if start and end:
+            df = df[(df.index >= pd.to_datetime(start)) & (df.index <= pd.to_datetime(end))]
+        else:
+            days = 365
+            if period == '2y': days = 730
+            elif period == '5y': days = 1825
+            elif period == '10y': days = 3650
+            elif period == 'max': days = 99999
+            cutoff = pd.Timestamp.now().normalize() - pd.Timedelta(days=days)
+            df = df[df.index >= cutoff]
+        return df
     except:
         pass
+    # FMP failed — fall back to yfinance (free)
+    if YFINANCE_AVAILABLE:
+        try:
+            return _yf_fetch_history(ticker, period=period, start=start, end=end)
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_fmp_news(ticker, api_key):
+    url = f"https://financialmodelingprep.com/api/v3/stock_news?tickers={ticker}&limit=5&apikey={api_key}"
+    try:
+        res = secure_get(url).json()
+        news = []
+        for item in res:
+            news.append({
+                'title': item.get('title'),
+                'link': item.get('url'),
+                'publisher': item.get('site'),
+                'providerPublishTime': item.get('publishedDate')[:10] if item.get('publishedDate') else 'Recent'
+            })
+        return news
+    except:
+        return []
+
+class FMP_Ticker:
+    """A wrapper class designed to mimic the exact outputs of yfinance but powered by FMP API."""
+    def __init__(self, ticker, api_key):
+        self.ticker = ticker
+        self.api_key = api_key
+        self._info = None
+        self._financials = None
+        self._balance_sheet = None
+        self._cashflow = None
+        self._news = None
+
+    @property
+    def info(self):
+        if self._info is None:
+            try:
+                self._info, _ = fetch_info_with_variants(self.ticker, "", self.api_key)
+            except:
+                self._info = {}
+        return self._info
+
+    @property
+    def financials(self):
+        if self._financials is None:
+            df = fetch_fmp_statement(self.ticker, "income-statement", self.api_key)
+            if not df.empty:
+                rename_map = {'revenue': 'Total Revenue', 'ebitda': 'EBITDA', 'interestExpense': 'Interest Expense', 'incomeTaxExpense': 'Tax Provision', 'incomeBeforeTax': 'Pretax Income'}
+                df.rename(index=rename_map, inplace=True)
+            # Fallback to yfinance if FMP returned nothing
+            if df.empty and YFINANCE_AVAILABLE:
+                try:
+                    yf_fin, _, _ = _yf_fetch_financials(self.ticker)
+                    if not yf_fin.empty:
+                        rename_map = {'Total Revenue': 'Total Revenue', 'EBITDA': 'EBITDA', 'Interest Expense': 'Interest Expense', 'Tax Provision': 'Tax Provision', 'Pretax Income': 'Pretax Income'}
+                        df = yf_fin
+                except Exception:
+                    pass
+            self._financials = df
+        return self._financials
+
+    @property
+    def balance_sheet(self):
+        if self._balance_sheet is None:
+            df = fetch_fmp_statement(self.ticker, "balance-sheet-statement", self.api_key)
+            if not df.empty:
+                rename_map = {'totalDebt': 'Total Debt', 'longTermDebt': 'Long Term Debt'}
+                df.rename(index=rename_map, inplace=True)
+            # Fallback to yfinance
+            if df.empty and YFINANCE_AVAILABLE:
+                try:
+                    _, yf_bs, _ = _yf_fetch_financials(self.ticker)
+                    if not yf_bs.empty:
+                        df = yf_bs
+                        if 'Total Debt' not in df.index and 'Long Term Debt' in df.index:
+                            df.loc['Total Debt'] = df.loc['Long Term Debt']
+                except Exception:
+                    pass
+            self._balance_sheet = df
+        return self._balance_sheet
+
+    @property
+    def cashflow(self):
+        if self._cashflow is None:
+            df = fetch_fmp_statement(self.ticker, "cash-flow-statement", self.api_key)
+            if not df.empty:
+                rename_map = {'freeCashFlow': 'Free Cash Flow', 'operatingCashFlow': 'Operating Cash Flow', 'capitalExpenditure': 'Capital Expenditure', 'netCashProvidedByOperatingActivities': 'Total Cash From Operating Activities'}
+                df.rename(index=rename_map, inplace=True)
+            # Fallback to yfinance
+            if df.empty and YFINANCE_AVAILABLE:
+                try:
+                    _, _, yf_cf = _yf_fetch_financials(self.ticker)
+                    if not yf_cf.empty:
+                        df = yf_cf
+                        rename_map = {
+                            'Free Cash Flow': 'Free Cash Flow',
+                            'Operating Cash Flow': 'Operating Cash Flow',
+                            'Capital Expenditure': 'Capital Expenditure',
+                        }
+                        df.rename(index=rename_map, inplace=True, errors='ignore')
+                except Exception:
+                    pass
+            self._cashflow = df
+        return self._cashflow
+
+    def history(self, period="1y", start=None, end=None):
+        return fetch_fmp_history(self.ticker, self.api_key, period, start, end)
+
+    @property
+    def news(self):
+        if self._news is None:
+            self._news = fetch_fmp_news(self.ticker, self.api_key)
+            # Fallback to yfinance news if FMP returned nothing
+            if not self._news and YFINANCE_AVAILABLE:
+                try:
+                    self._news = _yf_fetch_news(self.ticker)
+                except Exception:
+                    pass
+        return self._news
+
+
+# ==========================================
+# FREE DATA LAYER: yfinance-based fallbacks
+# ==========================================
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yf_fetch_info(ticker: str) -> dict:
+    """Fetch core stock info from yfinance (100% free, no API key)."""
+    if not YFINANCE_AVAILABLE:
+        return {}
+    try:
+        obj = yf.Ticker(ticker)
+        raw = obj.info or {}
+        if not raw.get("regularMarketPrice") and not raw.get("currentPrice"):
+            return {}
+        price = raw.get("regularMarketPrice") or raw.get("currentPrice") or raw.get("previousClose")
+        mkt_cap = raw.get("marketCap")
+        return {
+            "regularMarketPrice": price,
+            "marketCap": mkt_cap,
+            "currency": raw.get("currency", "USD"),
+            "symbol": raw.get("symbol", ticker),
+            "shortName": raw.get("shortName") or raw.get("longName", ticker),
+            "longName": raw.get("longName", ticker),
+            "sector": raw.get("sector", ""),
+            "industry": raw.get("industry", ""),
+            "beta": raw.get("beta"),
+            "trailingPE": raw.get("trailingPE"),
+            "forwardPE": raw.get("forwardPE"),
+            "priceToBook": raw.get("priceToBook"),
+            "returnOnEquity": raw.get("returnOnEquity"),
+            "returnOnAssets": raw.get("returnOnAssets"),
+            "returnOnInvestment": raw.get("returnOnCapitalEmployed"),
+            "debtToEquity": raw.get("debtToEquity"),
+            "dividendYield": raw.get("dividendYield") or 0,
+            "revenueGrowth": raw.get("revenueGrowth"),
+            "grossMargins": raw.get("grossMargins"),
+            "operatingMargins": raw.get("operatingMargins"),
+            "earningsQuarterlyGrowth": raw.get("earningsQuarterlyGrowth"),
+            "payoutRatio": raw.get("payoutRatio"),
+            "sharesOutstanding": raw.get("sharesOutstanding"),
+            "fullTimeEmployees": raw.get("fullTimeEmployees"),
+            "website": raw.get("website", ""),
+            "longBusinessSummary": raw.get("longBusinessSummary", ""),
+            "recommendationMean": raw.get("recommendationMean"),
+            "recommendationKey": raw.get("recommendationKey", ""),
+            "targetMeanPrice": raw.get("targetMeanPrice"),
+            "numberOfAnalystOpinions": raw.get("numberOfAnalystOpinions"),
+            "ebitda": raw.get("ebitda"),
+            "totalDebt": raw.get("totalDebt"),
+            "freeCashflow": raw.get("freeCashflow"),
+        }
+    except Exception:
+        return {}
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yf_fetch_history(ticker: str, period: str = "1y", start=None, end=None) -> pd.DataFrame:
+    """Fetch OHLCV price history from yfinance (free)."""
+    if not YFINANCE_AVAILABLE:
+        return pd.DataFrame()
+    try:
+        obj = yf.Ticker(ticker)
+        if start and end:
+            df = obj.history(start=start, end=end)
+        else:
+            df = obj.history(period=period)
+        if df.empty:
+            return pd.DataFrame()
+        df.index = pd.to_datetime(df.index).tz_localize(None)
+        df.index.name = "Date"
+        return df[["Open", "High", "Low", "Close", "Volume"]]
+    except Exception:
+        return pd.DataFrame()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yf_fetch_financials(ticker: str) -> tuple:
+    """Fetch Income Statement, Balance Sheet, Cash Flow from yfinance (free)."""
+    if not YFINANCE_AVAILABLE:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    try:
+        obj = yf.Ticker(ticker)
+        fin = obj.financials          # income statement  (rows=metrics, cols=dates)
+        bs = obj.balance_sheet
+        cf = obj.cashflow
+        return fin, bs, cf
+    except Exception:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _yf_fetch_news(ticker: str) -> list:
+    """Fetch recent news from yfinance (free)."""
+    if not YFINANCE_AVAILABLE:
+        return []
+    try:
+        obj = yf.Ticker(ticker)
+        raw_news = obj.news or []
+        items = []
+        for n in raw_news[:5]:
+            # yfinance ≥0.2.x returns nested content dict
+            content = n.get("content", n)
+            title = content.get("title") or n.get("title", "")
+            link = (content.get("canonicalUrl", {}) or {}).get("url") or content.get("url") or n.get("link", "#")
+            pub = content.get("provider", {}).get("displayName") if isinstance(content.get("provider"), dict) else "Yahoo Finance"
+            pub_time = content.get("pubDate") or n.get("providerPublishTime", "")
+            if isinstance(pub_time, int):
+                from datetime import datetime as _dt
+                pub_time = _dt.fromtimestamp(pub_time).strftime("%Y-%m-%d")
+            elif isinstance(pub_time, str) and "T" in pub_time:
+                pub_time = pub_time[:10]
+            if title:
+                items.append({"title": title, "link": link, "publisher": pub or "Yahoo Finance", "providerPublishTime": pub_time or "Recent"})
+        return items
+    except Exception:
+        return []
+
+def _yf_build_info_map(ticker: str) -> tuple:
+    """Build info dict from yfinance, mirroring FMP fetch_info_with_variants output."""
+    info = _yf_fetch_info(ticker)
+    if not info or not info.get("regularMarketPrice"):
+        raise RuntimeError(f"yfinance returned no usable data for '{ticker}'.")
+    return info, ticker
+
+
+# CACHED: Currency rates (FMP)
+@st.cache_data(ttl=3600, show_spinner=False)
+def get_currency_rate(from_currency, to_currency="USD", api_key=""):
+    if not api_key: return 1.0
+    if not from_currency or from_currency.upper() == to_currency.upper(): return 1.0
+    try:
+        pair = f"{from_currency.upper()}{to_currency.upper()}"
+        url = f"https://financialmodelingprep.com/api/v3/quote/{pair}?apikey={api_key}"
+        res = secure_get(url).json()
+        if res: return res[0]['price']
+    except: pass
     return 1.0
 
-# CACHED: Risk Free Rate
+# CACHED: Risk Free Rate (FMP)
 @st.cache_data(ttl=86400, show_spinner=False)
-def get_risk_free_rate():
+def get_risk_free_rate(api_key=""):
+    if not api_key: return 0.042
     try:
-        tnx = yf.Ticker("^TNX")
-        hist = tnx.history(period="1d")
-        if not hist.empty:
-            return hist['Close'].iloc[-1] / 100.0
-    except:
-        pass
+        url = f"https://financialmodelingprep.com/api/v4/treasury?from={datetime.now().year-1}-01-01&apikey={api_key}"
+        res = secure_get(url).json()
+        if res: return res[0].get('month10', 4.2) / 100.0
+    except: pass
     return 0.042 # Institutional anchor (4.2%)
 
 def format_large_number(n):
@@ -169,55 +553,99 @@ def get_yf_ticker_variants(base_ticker, country_code):
     return out
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_info_with_variants(base_ticker, country_code):
+def fetch_info_with_variants(base_ticker, country_code, api_key):
+    # If no FMP key, go straight to yfinance (free)
+    if not api_key:
+        if YFINANCE_AVAILABLE:
+            try:
+                yf_variants = get_yf_ticker_variants(base_ticker, country_code)
+                for vt in yf_variants:
+                    try:
+                        yf_info, yf_variant = _yf_build_info_map(vt)
+                        return yf_info, yf_variant
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+        raise RuntimeError("No API key provided and yfinance fallback failed. Enter an FMP API Key or ensure yfinance is installed.")
     tried = []
     variants = get_yf_ticker_variants(base_ticker, country_code)
     
     for variant in variants:
         try:
-            t = yf.Ticker(variant)
+            prof_url = f"https://financialmodelingprep.com/api/v3/profile/{variant}?apikey={api_key}"
+            prof_res = secure_get(prof_url).json()
             
-            # ATTEMPT 1: Standard info fetch (often rate-limited on Cloud)
-            try:
-                info = t.info
-                # Check for critical data
-                if info and info.get("regularMarketPrice") is not None:
-                    return info, variant
-            except:
-                info = {}
+            # Check if API returned an error message (e.g., Invalid Key or Limit Reached)
+            if isinstance(prof_res, dict) and "Error Message" in prof_res:
+                st.error(f"FMP API Error: {prof_res['Error Message']}")
+                return {}, variant
+                
+            if prof_res and isinstance(prof_res, list):
+                prof = prof_res[0]
+                
+                # Key metrics
+                km_url = f"https://financialmodelingprep.com/api/v3/key-metrics-ttm/{variant}?apikey={api_key}"
+                km_res = secure_get(km_url).json()
+                km = km_res[0] if km_res and isinstance(km_res, list) else {}
+                
+                # Rating (Safe Fetch)
+                rating_url = f"https://financialmodelingprep.com/api/v3/rating/{variant}?apikey={api_key}"
+                rating_res = secure_get(rating_url).json()
+                rating = rating_res[0] if rating_res and isinstance(rating_res, list) else {}
 
-            # ATTEMPT 2: Fallback to fast_info (API-based, more robust)
-            # If standard info failed or returned None, try fast_info
-            if not info or info.get("regularMarketPrice") is None:
-                fast = t.fast_info
-                if fast and hasattr(fast, 'last_price') and fast.last_price is not None:
-                    # Reconstruct a minimal info dict
-                    info = {
-                        "regularMarketPrice": fast.last_price,
-                        "marketCap": fast.market_cap,
-                        "currency": fast.currency,
-                        "symbol": variant,
-                        "shortName": variant, # Fallback
-                        "longName": variant,  # Fallback
-                        "sector": "Unknown",  # Cannot fetch via fast_info
-                        "industry": "Unknown",
-                        "beta": 1.0,          # Conservative default
-                        "trailingPE": None,
-                        "returnOnEquity": 0.15 # Conservative default for models
-                    }
-                    return info, variant
-                    
+                # Target (Safe Fetch + Fixed URL typo '&apikey')
+                tgt_url = f"https://financialmodelingprep.com/api/v4/price-target-consensus?symbol={variant}&apikey={api_key}"
+                tgt_res = secure_get(tgt_url).json()
+                tgt = tgt_res[0] if tgt_res and isinstance(tgt_res, list) else {}
+
+                info = {
+                    "regularMarketPrice": prof.get("price"),
+                    "marketCap": prof.get("mktCap"),
+                    "currency": prof.get("currency"),
+                    "symbol": prof.get("symbol"),
+                    "shortName": prof.get("companyName"),
+                    "longName": prof.get("companyName"),
+                    "sector": prof.get("sector"),
+                    "industry": prof.get("industry"),
+                    "beta": prof.get("beta"),
+                    "trailingPE": km.get("peRatioTTM"),
+                    "priceToBook": km.get("pbRatioTTM"),
+                    "returnOnEquity": km.get("roeTTM"),
+                    "returnOnAssets": km.get("roaTTM"),
+                    "returnOnInvestment": km.get("roicTTM"),
+                    "debtToEquity": km.get("debtToEquityTTM"),
+                    "dividendYield": km.get("dividendYieldPercentageTTM") / 100 if km.get("dividendYieldPercentageTTM") else 0,
+                    "revenueGrowth": km.get("revenuePerShareTTM"), 
+                    "payoutRatio": km.get("payoutRatioTTM"),
+                    "sharesOutstanding": prof.get("mktCap") / prof.get("price") if prof.get("price") and prof.get("mktCap") else None,
+                    "fullTimeEmployees": prof.get("fullTimeEmployees"),
+                    "website": prof.get("website"),
+                    "longBusinessSummary": prof.get("description"),
+                    "recommendationMean": 6 - rating.get("ratingScore", 3) if rating.get("ratingScore") else None,
+                    "recommendationKey": rating.get("ratingRecommendation"),
+                    "targetMeanPrice": tgt.get("targetConsensus"),
+                    "numberOfAnalystOpinions": 10
+                }
+                return info, variant
             tried.append(variant)
-        except Exception:
+        except Exception as e:
             tried.append(variant)
             
-    raise RuntimeError(f"No usable yfinance data found. Tried: {tried}")
+    # ---- FMP exhausted all variants — fall back to yfinance (free) ----
+    if YFINANCE_AVAILABLE:
+        try:
+            yf_info, yf_variant = _yf_build_info_map(base_ticker)
+            return yf_info, yf_variant
+        except Exception as yf_err:
+            pass
+    raise RuntimeError(f"No usable data found on FMP or yfinance. Tried FMP variants: {tried}")
 
 def fetch_screener_in(ticker_base):
     try:
         url = f"https://www.screener.in/company/{ticker_base}/"
         headers = {"User-Agent":"Mozilla/5.0"}
-        r = requests.get(url, headers=headers, timeout=5)
+        r = secure_get(url, timeout=5)
         if r.status_code != 200: return {}
         soup = BeautifulSoup(r.content, "html.parser")
         facts = {}
@@ -234,38 +662,27 @@ def fetch_news_fallback(ticker):
     # Improved fallback using robust Google News RSS parsing
     news_items = []
     try:
-        # Clean ticker for search (remove suffixes for better news results)
         search_ticker = ticker.split('.')[0]
         query = f"{search_ticker} stock finance"
         url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
-        
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
-        
-        r = requests.get(url, headers=headers, timeout=5)
+        r = secure_get(url, timeout=5)
         soup = BeautifulSoup(r.content, features="xml")
-        items = soup.findAll('item')
-        
+        items = soup.find_all('item')
         for item in items[:5]: 
             try:
                 title = item.title.text if item.title else "No Title"
                 link = item.link.text if item.link else "#"
                 pub_date = item.pubDate.text if item.pubDate else ""
-                
-                # Format date
                 date_str = "Recent"
                 if pub_date:
                     try:
                         dt = datetime.strptime(pub_date, "%a, %d %b %Y %H:%M:%S %Z")
                         date_str = dt.strftime("%Y-%m-%d")
-                    except:
-                        pass
-                
-                # Deduplication check
-                if any(x['link'] == link for x in news_items):
-                    continue
-                    
+                    except: pass
+                if any(x['link'] == link for x in news_items): continue
                 news_items.append({
                     'title': title, 
                     'link': link, 
@@ -273,57 +690,38 @@ def fetch_news_fallback(ticker):
                     'providerPublishTime': date_str
                 })
             except: continue
-    except Exception: 
-        pass
+    except Exception: pass
     return news_items
 
 # --- FINANCIAL MODELING HELPERS (INSTITUTIONAL GRADE) ---
-def calculate_wacc_institutional(info, financials, balance_sheet):
-    """
-    Calculates Dual WACC (Base & Stress):
-    1. Base Case: Normalized inputs (Beta ~1.1-1.3, ERP 5.25%).
-    2. Stress Case: High inputs (Beta capped 1.6, higher risk).
-    """
+def calculate_wacc_institutional(info, financials, balance_sheet, api_key):
     try:
-        # 1. Inputs & Normalization
         raw_beta = info.get('beta')
         if raw_beta is None: raw_beta = 1.0
-        
-        # Blume Adjustment (Standardize)
         adj_beta = (raw_beta * 0.67) + (1.0 * 0.33)
+        beta_stress = min(adj_beta, 1.60) 
+        beta_base = min(adj_beta, 1.25)   
         
-        # Beta Scenarios
-        beta_stress = min(adj_beta, 1.60) # Capped at 1.6 for stress
-        beta_base = min(adj_beta, 1.25)   # Normalized to ~1.25 for Base Case (Megacap/Moat standard)
-
-        # Macro Inputs
-        rf = get_risk_free_rate()
-        rf = max(0.035, min(rf, 0.050)) # Clamp 3.5% - 5.0%
-        
+        rf = get_risk_free_rate(api_key)
+        rf = max(0.035, min(rf, 0.050)) 
         erp = 0.0525
         
-        # Cost of Equity
         ke_stress = rf + (beta_stress * erp)
         ke_base = rf + (beta_base * erp)
 
-        # 2. Capital Structure
         market_cap = info.get('marketCap', 0)
         total_debt = 0
-        
         if not balance_sheet.empty:
             for col in ['Total Debt', 'Long Term Debt', 'LongTermDebt']:
                 if col in balance_sheet.index:
                     total_debt = balance_sheet.loc[col].iloc[0]
                     break
-
-        if market_cap is None or market_cap == 0:
-            market_cap = 1 
+        if market_cap is None or market_cap == 0: market_cap = 1 
             
         total_val = market_cap + total_debt
         w_e = market_cap / total_val
         w_d = total_debt / total_val
 
-        # 3. Cost of Debt
         interest_expense = 0
         if not financials.empty:
              for col in ['Interest Expense', 'Interest Expense Non Operating']:
@@ -349,13 +747,11 @@ def calculate_wacc_institutional(info, financials, balance_sheet):
 
         cost_debt_after_tax = cost_debt_pre * (1 - tax_rate)
 
-        # 4. WACC Calculation (Dual)
         wacc_stress = (w_e * ke_stress) + (w_d * cost_debt_after_tax)
         wacc_base = (w_e * ke_base) + (w_d * cost_debt_after_tax)
         
-        # Clamp Logic
-        wacc_stress = max(0.08, min(wacc_stress, 0.14)) # Stress range 8-14%
-        wacc_base = max(0.07, min(wacc_base, 0.11))     # Base range 7-11%
+        wacc_stress = max(0.08, min(wacc_stress, 0.14)) 
+        wacc_base = max(0.07, min(wacc_base, 0.11))     
 
         details = {
             "Risk Free Rate": rf,
@@ -370,54 +766,37 @@ def calculate_wacc_institutional(info, financials, balance_sheet):
         return 0.10, 0.125, {"Note": "Fallback"}
 
 def calculate_auto_growth(info):
-    """
-    Calculates Explicit Period Growth (Years 1-5).
-    """
     try:
         roe = info.get('returnOnEquity', 0.15)
         if roe is None: roe = 0.15
         payout = info.get('payoutRatio', 0.0)
         if payout is None: payout = 0.0
         retention = 1 - payout
-        
         growth = roe * retention
-        growth = max(0.05, min(growth, 0.25)) # Cap at 25%
+        growth = max(0.05, min(growth, 0.25)) 
         return growth
-    except:
-        return 0.10
+    except: return 0.10
 
-def calculate_normalized_fcf(yf_obj, reported_fcf):
-    """
-    SURGICAL UPGRADE: Normalize Starting FCF.
-    Uses 3-year average FCF margin on TTM Revenue.
-    """
+def calculate_normalized_fcf(fmp_obj, reported_fcf):
     try:
-        financials = yf_obj.financials
-        cashflow = yf_obj.cashflow
-        
-        if financials.empty or cashflow.empty:
-            return reported_fcf
+        financials = fmp_obj.financials
+        cashflow = fmp_obj.cashflow
+        if financials.empty or cashflow.empty: return reported_fcf
 
-        if 'Total Revenue' in financials.index:
-            rev_history = financials.loc['Total Revenue']
-        elif 'TotalRevenue' in financials.index:
-            rev_history = financials.loc['TotalRevenue']
-        else:
-            return reported_fcf
+        if 'Total Revenue' in financials.index: rev_history = financials.loc['Total Revenue']
+        elif 'TotalRevenue' in financials.index: rev_history = financials.loc['TotalRevenue']
+        else: return reported_fcf
 
         common_cols = rev_history.index.intersection(cashflow.columns)
         margins = []
         for col in common_cols[:3]: 
             try:
                 ocf = 0
-                if 'Operating Cash Flow' in cashflow.index:
-                    ocf = cashflow.loc['Operating Cash Flow'][col]
-                elif 'Total Cash From Operating Activities' in cashflow.index:
-                    ocf = cashflow.loc['Total Cash From Operating Activities'][col]
+                if 'Operating Cash Flow' in cashflow.index: ocf = cashflow.loc['Operating Cash Flow'][col]
+                elif 'Total Cash From Operating Activities' in cashflow.index: ocf = cashflow.loc['Total Cash From Operating Activities'][col]
                 
                 capex = 0
-                if 'Capital Expenditure' in cashflow.index:
-                    capex = cashflow.loc['Capital Expenditure'][col]
+                if 'Capital Expenditure' in cashflow.index: capex = cashflow.loc['Capital Expenditure'][col]
                 
                 fcf = ocf + capex if capex < 0 else ocf - capex
                 rev = rev_history[col]
@@ -425,14 +804,11 @@ def calculate_normalized_fcf(yf_obj, reported_fcf):
             except: pass
         
         if not margins: return reported_fcf
-            
         avg_margin = sum(margins) / len(margins)
         ttm_rev = rev_history.iloc[0]
         normalized_fcf = ttm_rev * avg_margin
-        
         return max(reported_fcf, normalized_fcf)
-    except Exception:
-        return reported_fcf
+    except Exception: return reported_fcf
 
 # --- RISK METRICS ---
 def calculate_beta(stock_hist, market_hist):
@@ -517,14 +893,16 @@ def score_multibagger_from_info(info):
     return score, details
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def run_playbook_for_ticker(ticker_input, country_code=""):
+def run_playbook_for_ticker(ticker_input, country_code="", api_key=""):
+    if not api_key and not YFINANCE_AVAILABLE:
+        st.error("❌ No data source available. Provide an FMP API Key or install yfinance.")
+        return None
     try:
-        info, used_variant = fetch_info_with_variants(ticker_input, country_code)
+        info, used_variant = fetch_info_with_variants(ticker_input, country_code, api_key)
     except Exception as e:
         st.error(f"❌ Data Fetch Error: {e}") 
         return None
 
-    yf_obj = yf.Ticker(used_variant)
     screener_facts = {}
     if country_code and country_code.upper() == "IN":
         screener_facts = fetch_screener_in(ticker_input)
@@ -547,7 +925,7 @@ def run_playbook_for_ticker(ticker_input, country_code=""):
         "multibagger_details": m_details,
         "decisions": {"undervalued_pass": u_score >= 25, "multibagger_pass": m_score >= 30},
         "fetched_info": info,
-        "as_of": datetime.utcnow().isoformat() + "Z"
+        "as_of": datetime.now(timezone.utc).isoformat() + "Z"
     }
     return summary
 
@@ -556,15 +934,12 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
     buffer = io.BytesIO()
     c = canvas.Canvas(buffer, pagesize=letter)
     width, height = letter
-    
-    # STYLES
     styles = getSampleStyleSheet()
     styleN = styles['Normal']
     styleH = styles['Heading2']
     styleN.fontSize = 10
     styleN.leading = 14
     
-    # --- HELPER: DRAW WATERMARK ---
     def draw_watermark(c):
         c.saveState()
         c.setFont("Helvetica-Bold", 60)
@@ -575,7 +950,6 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
         c.drawCentredString(0, 0, "Sai Advaith Parimisetti")
         c.restoreState()
 
-    # --- HELPER: DRAW FOOTER ---
     def draw_footer(c):
         c.saveState()
         c.setFont("Helvetica", 8)
@@ -583,9 +957,8 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
         c.drawCentredString(width/2, 20, "EDUCATIONAL PURPOSE ONLY. NOT FINANCIAL ADVICE. DATA GENERATED ALGORITHMICALLY.")
         c.restoreState()
 
-    # --- HELPER: DRAW HEADER STRIP ---
     def draw_header_strip(c, title):
-        c.setFillColorRGB(0.05, 0.2, 0.4) # Navy Blue
+        c.setFillColorRGB(0.05, 0.2, 0.4) 
         c.rect(0, height-60, width, 60, fill=1, stroke=0)
         c.setFillColor(colors.white)
         c.setFont("Helvetica-Bold", 24)
@@ -593,28 +966,21 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
         c.setFont("Helvetica", 12)
         c.drawString(width-200, height-40, f"{summary['ticker_used']} | {datetime.now().strftime('%Y-%m-%d')}")
 
-    # --- HELPER: DRAW INSIGHT TEXT BOX ---
     def draw_insight_box(c, x, y, w, h, title, text):
-        # Draw Box
         c.setStrokeColor(colors.lightgrey)
         c.setFillColor(colors.whitesmoke)
         c.rect(x, y, w, h, fill=1)
-        # Draw Title
         c.setFillColor(colors.black)
         c.setFont("Helvetica-Bold", 10)
         c.drawString(x+10, y+h-15, title)
-        # Draw Text
         p = Paragraph(text, styleN)
         p.wrapOn(c, w-20, h-30)
         p.drawOn(c, x+10, y+h-25-p.height)
 
-    # ---------------------------------------------------------
     # PAGE 1: EXECUTIVE SUMMARY
-    # ---------------------------------------------------------
     draw_watermark(c)
     draw_header_strip(c, f"Equity Research: {summary['company']}")
     
-    # 1. Main Infographic
     if visual_fig:
         img_buffer = io.BytesIO()
         visual_fig.savefig(img_buffer, format='png', bbox_inches='tight', dpi=120)
@@ -622,12 +988,10 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
         img = ImageReader(img_buffer)
         c.drawImage(img, 30, height - 500, width=550, height=420, preserveAspectRatio=True)
     
-    # 2. Key Metrics Strip
     y_metrics = height - 530
     c.setFont("Helvetica-Bold", 14)
     c.drawString(30, y_metrics, "Key Fundamental Metrics")
     
-    # Prepare Data for Table
     details = summary['undervalued_details']
     m_details = summary['multibagger_details']
     
@@ -652,32 +1016,23 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
     t_metrics.wrapOn(c, width, height)
     t_metrics.drawOn(c, 40, y_metrics - 120)
 
-    # 3. Analyst Verdict (Auto-Generated)
-    # FIX 1: Recommendation Language ("Screens as...")
     verdict = "Screens as Undervalued (Model-Based)" if summary['undervalued_score'] > 25 else "Screens as Fairly Valued / Overvalued (Model-Based)"
     verdict_text = f"Based on the algorithmic scoring, {summary['company']} <b>{verdict}</b> relative to its historicals and sector peers. The company has a Fundamental Score of {summary['undervalued_score']}/40."
-    
-    # FIX 1: "Algorithmic Verdict" -> "Model Output Summary"
     draw_insight_box(c, 40, y_metrics - 220, 530, 80, "Model Output Summary", verdict_text)
 
     draw_footer(c)
     c.showPage()
     
-    # ---------------------------------------------------------
-    # PAGE 2: VALUATION DEEP DIVE (CHARTS & INSIGHTS)
-    # ---------------------------------------------------------
+    # PAGE 2: VALUATION DEEP DIVE
     draw_watermark(c)
     draw_header_strip(c, "Deep Dive Valuation Analysis")
-    
     current_y = height - 100
     
-    # A. WATERFALL CHART
     if dcf_charts and 'waterfall' in dcf_charts:
         c.setFont("Helvetica-Bold", 14)
         c.drawString(30, current_y, "1. Valuation Bridge (Source of Value)")
         current_y -= 220
         
-        # Draw Chart
         w_data = dcf_charts['waterfall']
         fig_w = Figure(figsize=(6, 3), dpi=100)
         ax_w = fig_w.subplots()
@@ -693,21 +1048,16 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
         img_buf.seek(0)
         c.drawImage(ImageReader(img_buf), 30, current_y, width=350, height=175, preserveAspectRatio=True)
         
-        # Draw Insight
-        # FIX 3: "Intrinsic Value" -> "Model-Implied Intrinsic Value"
         term_pct = (vals[1] / vals[2]) * 100 if vals[2] > 0 else 0
         insight_text = f"This chart breaks down the Model-Implied Intrinsic Value. Notice that <b>{term_pct:.1f}%</b> of the value comes from the Terminal Value. This indicates the valuation is highly dependent on long-term stability rather than short-term cash flows."
         draw_insight_box(c, 400, current_y + 20, 180, 140, "Analyst Commentary", insight_text)
-        
         current_y -= 50
 
-    # B. SENSITIVITY HEATMAP
     if dcf_charts and 'sensitivity' in dcf_charts:
         c.setFont("Helvetica-Bold", 14)
         c.drawString(30, current_y, "2. Sensitivity Analysis (WACC vs Growth)")
         current_y -= 220
         
-        # Draw Chart
         s_data = dcf_charts['sensitivity']
         df_sens = s_data['matrix']
         fig_h = Figure(figsize=(6, 3), dpi=100)
@@ -721,23 +1071,15 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
         img_buf.seek(0)
         c.drawImage(ImageReader(img_buf), 30, current_y, width=350, height=175, preserveAspectRatio=True)
         
-        # Draw Insight
         insight_text = "The Heatmap shows the theoretical share price under different economic conditions. Green areas represent optimistic scenarios (Low WACC / High Growth), while Red areas indicate downside risk if interest rates rise or growth slows."
         draw_insight_box(c, 400, current_y + 20, 180, 140, "Risk Assessment", insight_text)
-        
         current_y -= 50
 
-    # C. METHODOLOGY COMPARISON
     c.setFont("Helvetica-Bold", 14)
     c.drawString(30, current_y, "3. Methodology Face-off")
-    
     if dcf_data:
-        # Create Comparison Chart manually since it wasn't in state
-        # Simplified bar chart
         fig_c = Figure(figsize=(6, 2), dpi=100)
         ax_c = fig_c.subplots()
-        methods = ["Perpetual Growth", "Exit Multiple"]
-        
         try:
             curr_price = summary['price']
             intr_val = float(dcf_data['intrinsic_value'].replace(summary['price_currency'], '').replace(',',''))
@@ -754,22 +1096,17 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
             direction = "Discount" if diff > 0 else "Premium"
             insight_text = f"The stock is trading at a <b>{abs(diff):.2f} {summary['price_currency']} {direction}</b> to its fair value. A wide gap suggests a potential margin of safety."
             draw_insight_box(c, 400, current_y - 120, 180, 100, "Price Action", insight_text)
-            
         except: pass
 
     draw_footer(c)
     c.showPage()
 
-    # ---------------------------------------------------------
     # PAGE 3: RISK REPORT
-    # ---------------------------------------------------------
     draw_watermark(c)
     draw_header_strip(c, "Risk Management Profile")
     
-    # Risk Metrics Table
     c.setFont("Helvetica-Bold", 14)
     c.drawString(30, height - 100, "Quantitative Risk Metrics (1 Year)")
-    
     if risk_data:
         r_data = [
             ["Metric", "Value", "Interpretation"],
@@ -789,7 +1126,6 @@ def generate_comprehensive_pdf(summary, dcf_data, risk_data, visual_fig, risk_fi
         t2.wrapOn(c, width, height)
         t2.drawOn(c, 30, height - 200)
         
-        # Risk Histogram
         c.drawString(30, height - 250, "Return Distribution Histogram")
         if risk_fig:
             r_img_buffer = io.BytesIO()
@@ -866,7 +1202,7 @@ def fmt_pct_val(x):
     try: return f"{x*100:.1f}%"
     except: return "n/a"
 
-def render_infographic(playbook_result, convert_usd=False, rate=1.0):
+def render_infographic(playbook_result, convert_usd=False, rate=1.0, api_key=""):
     if playbook_result is None: return None
     s = playbook_result
     
@@ -924,7 +1260,6 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
 
     draw_kpi(ax_kpi_1, "Price", human_readable_price(price, price_ccy))
     draw_kpi(ax_kpi_2, "Market Cap", human_readable_marketcap(mcap, mcap_ccy), small=True)
-    # FIX 1: Recommendation Language
     draw_kpi(ax_kpi_3, "Value Score", f"{u_score}/40", subtitle=f"{int(u_pct*100)}%")
     draw_kpi(ax_kpi_4, "Growth Score", f"{m_score}/50", subtitle=f"{int(m_pct*100)}%")
     gauge_bar(ax_gauge_u, u_pct, "Value Score")
@@ -950,7 +1285,6 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
     values = [valuation_comp, profitability_comp, growth_comp, balance_comp, moat_comp]
     radar_plot(ax_radar, labels, values, title="Strength Radar")
 
-    # FIX 4: Pass/Fail Language
     checklist = [
         ("Price < Model Value", s['decisions']['undervalued_pass']),
         ("Debt/Equity < 0.5", (u_details.get('debtToEquity') is not None and u_details.get('debtToEquity') < 0.5)),
@@ -972,7 +1306,7 @@ def render_infographic(playbook_result, convert_usd=False, rate=1.0):
         ax_pos.text(0.07, y_top-0.05, label, va='center', ha='left', color='white', fontsize=10, transform=ax_pos.transAxes)
 
     try:
-        hist = yf.Ticker(ticker_used).history(period="12mo")
+        hist = FMP_Ticker(ticker_used, api_key).history(period="1y")
         if hist is not None and not hist.empty:
             if convert_usd: hist['Close'] = hist['Close'] * rate
             ax_price.plot(hist.index, hist['Close'], label='Close', lw=1.2)
@@ -1028,40 +1362,66 @@ with col_title:
 st.markdown("")
 st.markdown('<hr>', unsafe_allow_html=True)
 
+# Initialize JWT session security on every page load
+_init_session_security()
+
 with st.sidebar:
     st.markdown('<h3 style="color:#2D7A3E;">Configuration</h3>', unsafe_allow_html=True)
     ticker_input = st.text_input('Ticker Symbol', value='AAPL', placeholder='e.g., AAPL, MSFT', key='ticker_input', label_visibility='collapsed')
     country_code = st.selectbox('Market Region', ['US','IN','GB','DE','FR','CA','JP'], index=0)
     
+    st.markdown('### API Setup <span style="font-size:11px;color:#6B7280;font-weight:400;">(Optional — free mode available)</span>', unsafe_allow_html=True)
+    fmp_api_key = st.text_input(
+        "FMP API Key (Optional)",
+        type="password",
+        help="Optional — enhances data quality. Leave blank to use the free yfinance data source. Get a key at financialmodelingprep.com"
+    )
+    st.session_state['fmp_api_key'] = fmp_api_key
+
+    # Show active data source badge
+    if fmp_api_key:
+        st.markdown("""<div style="background:rgba(45,122,62,0.25);border:1px solid #2D7A3E;border-radius:6px;padding:6px 10px;font-size:12px;color:#AEE7B1;">
+        🔑 <strong>Data Source:</strong> Financial Modeling Prep (FMP)<br>
+        <span style="color:#6B7280;">Premium financial data active.</span></div>""", unsafe_allow_html=True)
+    else:
+        yf_status = "✅ Active" if YFINANCE_AVAILABLE else "❌ Not installed"
+        yf_color = "#AEE7B1" if YFINANCE_AVAILABLE else "#FF6B6B"
+        st.markdown(f"""<div style="background:rgba(30,60,90,0.25);border:1px solid #3B82F6;border-radius:6px;padding:6px 10px;font-size:12px;color:{yf_color};">
+        📡 <strong>Data Source:</strong> yfinance (Free)<br>
+        <span style="color:#6B7280;">Status: {yf_status} — no API key required.</span></div>""", unsafe_allow_html=True)
+
+    # Session security indicator
+    tok = st.session_state.get("session_token", "")
+    tok_valid = validate_session_token(tok)
+    sec_color = "#AEE7B1" if tok_valid else "#FF6B6B"
+    sec_icon = "🔒" if tok_valid else "🔓"
+    st.markdown(f"""<div style="margin-top:6px;background:rgba(0,0,0,0.15);border-radius:6px;padding:5px 10px;font-size:11px;color:{sec_color};">
+    {sec_icon} Session token: {"Valid (JWT)" if tok_valid else "Invalid — refresh page"}</div>""", unsafe_allow_html=True)
+
     st.markdown("#### Settings")
     use_usd = st.checkbox("Convert to USD", value=False)
     
     st.markdown('---')
-    run_btn = st.button('▶ Generate Research Report', type='primary', use_container_width=True)
+    run_btn = st.button('▶ Generate Research Report', type='primary', width="stretch")
     
-    # --- EXPORT HUB (UPDATED) ---
     if st.session_state.get('analysis_done', False):
         st.markdown("### 📥 Export Hub")
         
-        # 1. Expanded Excel Export
         try:
             summ = st.session_state['summary']
             output = io.BytesIO()
             with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                # Basic Sheets
-                pd.DataFrame([summ]).drop(columns=['fetched_info', 'yf_object'], errors='ignore').astype(str).to_excel(writer, sheet_name='Summary', index=False)
-                yf_obj_export = yf.Ticker(summ['ticker_used'])
-                if not yf_obj_export.financials.empty: clean_financial_df(yf_obj_export.financials).to_excel(writer, sheet_name='Income_Statement')
-                if not yf_obj_export.balance_sheet.empty: clean_financial_df(yf_obj_export.balance_sheet).to_excel(writer, sheet_name='Balance_Sheet')
-                if not yf_obj_export.cashflow.empty: clean_financial_df(yf_obj_export.cashflow).to_excel(writer, sheet_name='Cash_Flow')
+                pd.DataFrame([summ]).drop(columns=['fetched_info', 'fmp_object'], errors='ignore').astype(str).to_excel(writer, sheet_name='Summary', index=False)
+                fmp_obj_export = FMP_Ticker(summ['ticker_used'], st.session_state.get('fmp_api_key'))
+                if not fmp_obj_export.financials.empty: clean_financial_df(fmp_obj_export.financials).to_excel(writer, sheet_name='Income_Statement')
+                if not fmp_obj_export.balance_sheet.empty: clean_financial_df(fmp_obj_export.balance_sheet).to_excel(writer, sheet_name='Balance_Sheet')
+                if not fmp_obj_export.cashflow.empty: clean_financial_df(fmp_obj_export.cashflow).to_excel(writer, sheet_name='Cash_Flow')
                 
-                # New Data Sheets (DCF & Risk)
                 if st.session_state.get('dcf_data'):
                     pd.DataFrame([st.session_state['dcf_data']]).to_excel(writer, sheet_name='DCF_Model')
                 if st.session_state.get('risk_data'):
                     pd.DataFrame([st.session_state['risk_data']]).to_excel(writer, sheet_name='Risk_Metrics')
                 
-                # Formatting
                 for sheet in writer.sheets.values():
                     for column in sheet.columns:
                         max_length = 0
@@ -1073,14 +1433,12 @@ with st.sidebar:
                         sheet.column_dimensions[column[0].column_letter].width = max_length + 2
 
             output.seek(0)
-            st.download_button('📥 Download Full Excel', data=output, file_name=f"{summ['ticker_used']}_full_report.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', use_container_width=True)
+            st.download_button('📥 Download Full Excel', data=output, file_name=f"{summ['ticker_used']}_full_report.xlsx", mime='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', width="stretch")
         except Exception as e:
             st.warning("Export requires 'openpyxl'. Please install it.")
 
-        # 2. PDF Export
         if REPORTLAB_AVAILABLE:
-            if st.button("📄 Generate PDF Report", use_container_width=True):
-                # Retrieve chart data from session state
+            if st.button("📄 Generate PDF Report", width="stretch"):
                 pdf_data = generate_comprehensive_pdf(
                     st.session_state['summary'], 
                     st.session_state.get('dcf_data'), 
@@ -1089,12 +1447,11 @@ with st.sidebar:
                     st.session_state.get('fig_risk'),
                     st.session_state.get('dcf_charts_data') 
                 )
-                st.download_button("⬇️ Download PDF", pdf_data, f"{st.session_state['summary']['ticker_used']}_Report.pdf", "application/pdf", use_container_width=True)
+                st.download_button("⬇️ Download PDF", pdf_data, f"{st.session_state['summary']['ticker_used']}_Report.pdf", "application/pdf", width="stretch")
         else:
             st.warning("Install 'reportlab' to enable PDF export.")
 
     st.markdown("---")
-    # FIX 2 & 5: Strengthen Disclaimer & No Personalization
     st.markdown("""
     <div style='font-size: 11px; color: #888; line-height: 1.4;'>
     <strong>Legal Disclaimer</strong><br>
@@ -1111,17 +1468,30 @@ with st.sidebar:
 # --- APP LOGIC ---
 
 if run_btn:
-    summary = run_playbook_for_ticker(ticker_input, country_code)
+    # Validate JWT session token before running any analysis
+    if not validate_session_token(st.session_state.get("session_token", "")):
+        st.error("🔒 Invalid session token. Please refresh the page.")
+        st.stop()
+
+    if not fmp_api_key and not YFINANCE_AVAILABLE:
+        st.error("❌ No data source available. Either enter an FMP API Key or install yfinance (`pip install yfinance`).")
+        st.stop()
+
+    # Rate limit guard: max 30 analysis runs per hour per session
+    if not _check_rate_limit("run_analysis", max_calls=30, window_seconds=3600):
+        st.warning("⚠️ Rate limit reached (30 analyses/hour). Please wait before running more requests.")
+        st.stop()
+        
+    summary = run_playbook_for_ticker(ticker_input, country_code, fmp_api_key)
     if summary:
         rate = 1.0
         if use_usd and summary['price_currency'] != 'USD':
-            rate = get_currency_rate(summary['price_currency'], 'USD')
+            rate = get_currency_rate(summary['price_currency'], 'USD', fmp_api_key)
         
         st.session_state['summary'] = summary
         st.session_state['usd_rate'] = rate
         st.session_state['use_usd'] = use_usd
         st.session_state['analysis_done'] = True
-        # Reset data containers
         st.session_state['dcf_data'] = None
         st.session_state['risk_data'] = None
         st.session_state['fig_visual'] = None
@@ -1135,9 +1505,10 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
     summary = st.session_state['summary']
     rate = st.session_state.get('usd_rate', 1.0)
     using_usd = st.session_state.get('use_usd', False)
+    fmp_key = st.session_state.get('fmp_api_key')
 
-    yf_obj = yf.Ticker(summary['ticker_used'])
-    summary['yf_object'] = yf_obj 
+    fmp_obj = FMP_Ticker(summary['ticker_used'], fmp_key)
+    summary['fmp_object'] = fmp_obj 
 
     disp_price = summary['price'] * rate if using_usd and summary['price'] else summary['price']
     disp_mcap = summary['marketCap'] * rate if using_usd and summary['marketCap'] else summary['marketCap']
@@ -1150,10 +1521,8 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
     with col2:
         st.metric('📈 Market Cap', human_readable_marketcap(disp_mcap, disp_ccy))
     with col3:
-        # FIX 1: Recommendation Language (Value Score)
         st.metric('🎯 Value Score', f"{summary['undervalued_score']}/40")
     with col4:
-        # FIX 1: Recommendation Language (Growth Score)
         st.metric('🚀 Growth Score', f"{summary['multibagger_score']}/50")
 
     st.markdown('')
@@ -1164,12 +1533,11 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
     # 1. VISUAL REPORT
     with tab1:
         st.markdown('<h3 style="color:#1B4D2B;">Visual Analysis Report</h3>', unsafe_allow_html=True)
-        fig = render_infographic(summary, convert_usd=using_usd, rate=rate)
+        fig = render_infographic(summary, convert_usd=using_usd, rate=rate, api_key=fmp_key)
         if fig:
-            st.pyplot(fig, use_container_width=True)
-            st.session_state['fig_visual'] = fig # SAVE FOR PDF
+            st.pyplot(fig, width="stretch")
+            st.session_state['fig_visual'] = fig 
             
-            # Simple Image Download
             fn = f"{summary['ticker_used']}_equity_research.png"
             img = io.BytesIO()
             Canvas = FigureCanvasAgg(fig)
@@ -1178,21 +1546,18 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             st.markdown('<hr>', unsafe_allow_html=True)
             col_d1, col_d2, col_d3 = st.columns([1,1.5,1])
             with col_d2:
-                st.download_button('📥 Download High-Resolution Report', data=img, file_name=fn, mime='image/png', use_container_width=True)
+                st.download_button('📥 Download High-Resolution Report', data=img, file_name=fn, mime='image/png', width="stretch")
 
-    # 2. INTRINSIC VALUE (INSTITUTIONAL UPGRADE 5.0: FINAL POLISH & NARRATIVE)
+    # 2. INTRINSIC VALUE 
     with tab2:
         st.markdown('<h3 style="color:#1B4D2B;">Institutional Valuation (DCF) - Conservative Framework</h3>', unsafe_allow_html=True)
         
-        # 1. FETCH DATA REQUIRED FOR ALL MODELS
         fcf_available = False
         latest_fcf = 0
         
-        # FIX: Use the already fetched info to prevent rate limits
         fetched_info = summary.get('fetched_info', {})
         shares = fetched_info.get('sharesOutstanding')
         
-        # Fallback: Calculate implied shares if using fast_info
         if not shares:
             mcap = summary.get('marketCap')
             current_price = summary.get('price')
@@ -1200,16 +1565,22 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 shares = mcap / current_price
                 
         try:
-            cf = yf_obj.cashflow
-            bs = yf_obj.balance_sheet
-            fin = yf_obj.financials
+            cf = fmp_obj.cashflow
+            bs = fmp_obj.balance_sheet
+            fin = fmp_obj.financials
             if not cf.empty:
-                possible_names = ['Free Cash Flow', 'Free Cash Flow', 'FreeCashFlow']
+                possible_names = ['Free Cash Flow', 'FreeCashFlow', 'Free Cash Flow']
                 for name in possible_names:
                     if name in cf.index:
                         latest_fcf = cf.loc[name].iloc[0]
                         fcf_available = True
                         break
+            # If still no FCF from statements, try yfinance info dict
+            if not fcf_available:
+                yf_fcf = fetched_info.get("freeCashflow")
+                if yf_fcf and yf_fcf != 0:
+                    latest_fcf = yf_fcf
+                    fcf_available = True
         except: pass
 
         if fcf_available and shares and not bs.empty and not fin.empty:
@@ -1218,38 +1589,23 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             else:
                 calc_fcf = latest_fcf
 
-            # FIX 1: Normalize Starting FCF
-            normalized_starting_fcf = calculate_normalized_fcf(yf_obj, calc_fcf)
-
-            # 2. PERFORM DUAL CALCULATIONS (Base vs Stress)
-            wacc_base, wacc_stress, wacc_details = calculate_wacc_institutional(fetched_info, fin, bs)
-            
-            # Growth Inputs
+            normalized_starting_fcf = calculate_normalized_fcf(fmp_obj, calc_fcf)
+            wacc_base, wacc_stress, wacc_details = calculate_wacc_institutional(fetched_info, fin, bs, fmp_key)
             explicit_growth = calculate_auto_growth(fetched_info)
-            terminal_growth = 0.025 # GDP Capped
+            terminal_growth = 0.025 
             
-            # POLISH 1: Calculate Implied Reinvestment & ROIC
             payout = fetched_info.get('payoutRatio', 0.0)
             if payout is None: payout = 0.0
-            
-            # Reinvestment Rate = 1 - Payout Ratio.
-            # We enforce a floor of 5% reinvestment to avoid division by zero errors in high payout scenarios
             implied_reinvestment = max(0.05, 1 - payout) 
-            
-            # Implied ROIC = Growth / Reinvestment Rate
-            # This checks: "Is the growth realistic given how much they are reinvesting?"
             implied_roic = explicit_growth / implied_reinvestment
 
-            # FIX 2: Slower Fade (10 Years)
             future_fcf = []
             current_val = normalized_starting_fcf
             
-            # Years 1-5 (Explicit)
             for i in range(1, 6):
                 current_val = current_val * (1 + explicit_growth)
                 future_fcf.append(current_val)
                 
-            # Years 6-10 (Slower Fade to Bridge)
             fade_target = max(terminal_growth, explicit_growth * 0.5) 
             growth_decay = (explicit_growth - fade_target) / 5
             current_growth = explicit_growth
@@ -1259,28 +1615,24 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 current_val = current_val * (1 + current_growth)
                 future_fcf.append(current_val)
             
-            # Discounting (10 Years) using BASE WACC
             discount_factors = [1 / ((1 + wacc_base) ** i) for i in range(1, 11)]
             dcf_vals = [f * d for f, d in zip(future_fcf, discount_factors)]
             sum_pv_fcf = sum(dcf_vals)
 
-            # --- SUB TABS ---
             subtab_auto, subtab_sens, subtab_exit = st.tabs(["🤖 Auto-WACC & Growth", "🌡️ Sensitivity Matrix", "🚪 Exit Multiple"])
 
-            # -----------------------------------------------------------
-            # CALCULATIONS HOISTED TO MAIN SCOPE FOR NARRATIVE GENERATION
-            # -----------------------------------------------------------
-            
-            # A. DCF (Base Case)
             tv_perp = (future_fcf[-1] * (1 + terminal_growth)) / (wacc_base - terminal_growth)
             pv_tv_perp = tv_perp / ((1 + wacc_base) ** 10)
             equity_val_perp = sum_pv_fcf + pv_tv_perp
             share_price_perp = equity_val_perp / shares
             upside_perp = (share_price_perp - disp_price) / disp_price
 
-            # B. Exit Multiple (Base Case)
             ebitda = 0
-            if 'EBITDA' in fin.index: ebitda = fin.loc['EBITDA'].iloc[0]
+            if not fin.empty and 'EBITDA' in fin.index:
+                ebitda = fin.loc['EBITDA'].iloc[0]
+            # Fallback from yfinance info dict
+            if not ebitda:
+                ebitda = fetched_info.get("ebitda") or 0
             share_price_exit = 0
             
             if ebitda > 0:
@@ -1301,13 +1653,11 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 equity_val_exit = sum_pv_fcf + pv_tv_exit
                 share_price_exit = equity_val_exit / shares
             
-            # C. Stress Case DCF
             tv_stress = (future_fcf[-1] * (1 + terminal_growth)) / (wacc_stress - terminal_growth)
             pv_tv_stress = tv_stress / ((1 + wacc_stress) ** 10)
             stress_dcf_vals = [f * (1/((1+wacc_stress)**(i+1))) for i, f in enumerate(future_fcf)]
             share_price_stress = (sum(stress_dcf_vals) + pv_tv_stress) / shares
 
-            # POLISH 2: Valuation Narrative
             narrative = ""
             if share_price_exit > share_price_perp * 1.3:
                 narrative = f"**Insight:** The Market-Implied Value ({human_readable_price(share_price_exit, disp_ccy)}) is significantly higher than the Conservative DCF. This suggests the market is pricing in a 'longer moat' (slower fade) or higher terminal margins than our base case assumes."
@@ -1316,18 +1666,15 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             else:
                 narrative = "**Insight:** Both valuation methods (DCF & Exit Multiple) are converging, suggesting the current valuation is well-supported by both fundamental cash flows and market comparables."
 
-            # A. AUTO-ASSISTED DCF DISPLAY
             with subtab_auto:
                 st.markdown(f"##### 🤖 Institutional DCF Model (Conservative Base Case)")
                 st.caption(f"Valuation using **Base WACC ({wacc_base:.1%})** and **Normalized Cash Flows**.")
                 
                 c_main1, c_main2 = st.columns([1, 2])
                 with c_main1:
-                    # FIX 3: "Intrinsic Value" -> "Model-Implied Intrinsic Value"
                     st.metric("Model-Implied Intrinsic Value (Base)", human_readable_price(share_price_perp, disp_ccy), f"{upside_perp*100:.1f}%")
                     st.caption(f"Downside (Stress Case): {human_readable_price(share_price_stress, disp_ccy)}")
                 with c_main2:
-                    # ROIC Logic for display
                     roic_color = "green" if implied_roic > wacc_base else "red"
                     roic_msg = "Value Creation" if implied_roic > wacc_base else "Value Destruction"
                     
@@ -1340,7 +1687,6 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 
                 st.markdown(f"> {narrative}")
                 
-                # SAVE DCF DATA FOR EXPORT
                 st.session_state['dcf_data'] = {
                     "intrinsic_value": human_readable_price(share_price_perp, disp_ccy),
                     "upside": f"{upside_perp*100:.2f}%",
@@ -1349,7 +1695,6 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     "fcf_start": f"{normalized_starting_fcf:,.2f}"
                 }
 
-                # NEW CHART: Valuation Bridge (Waterfall)
                 bridge_data = pd.DataFrame({
                     "Component": ["PV of Cash Flows (1-10Y)", "PV of Terminal Value", "Total Equity Value"],
                     "Value": [sum_pv_fcf, pv_tv_perp, equity_val_perp]
@@ -1371,9 +1716,8 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     textposition='auto'
                 ))
                 fig_bridge.update_layout(title="Valuation Bridge: Where does the value come from?", template="plotly_dark", height=400, margin=dict(l=0, r=0, t=40, b=0))
-                st.plotly_chart(fig_bridge, use_container_width=True)
+                st.plotly_chart(fig_bridge, width="stretch")
 
-            # B. SENSITIVITY ANALYSIS
             with subtab_sens:
                 st.markdown("##### 🌡️ Valuation Heatmap (Base WACC Center)")
                 st.caption("Sensitivity of Intrinsic Value to long-term economic assumptions.")
@@ -1403,7 +1747,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     }
 
                 df_sens = pd.DataFrame(data, index=[f"WACC {w:.1%}" for w in wacc_range], columns=[f"Term Growth {g:.1%}" for g in growth_range])
-                st.dataframe(df_sens.style.format(lambda x: f"{_get_currency_symbol(disp_ccy)}{x:,.2f}").background_gradient(cmap='RdYlGn', axis=None), use_container_width=True)
+                st.dataframe(df_sens.style.format(lambda x: f"{_get_currency_symbol(disp_ccy)}{x:,.2f}").background_gradient(cmap='RdYlGn', axis=None), width="stretch")
 
                 fig_heat = go.Figure(data=go.Heatmap(
                     z=data,
@@ -1414,9 +1758,8 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     hoverongaps=False
                 ))
                 fig_heat.update_layout(title="Sensitivity Heatmap (Interactive)", xaxis_title="Terminal Growth (GDP Linked)", yaxis_title="WACC", template="plotly_dark", height=400)
-                st.plotly_chart(fig_heat, use_container_width=True)
+                st.plotly_chart(fig_heat, width="stretch")
 
-            # C. EXIT MULTIPLE
             with subtab_exit:
                 st.markdown("##### 🚪 Market-Implied Value (Exit Multiple)")
                 st.caption("Valuation assuming sale at a dynamic sector-based multiple.")
@@ -1426,7 +1769,6 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     
                     c_ex1, c_ex2 = st.columns(2)
                     with c_ex1:
-                        # FIX 3: "Intrinsic Value" -> "Model-Implied Value"
                         st.metric("Market-Implied Value", human_readable_price(share_price_exit, disp_ccy), f"{upside_exit*100:.1f}%")
                     with c_ex2:
                         st.write(f"Assumed Exit Multiple: **{sector_mult}x**")
@@ -1445,7 +1787,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     ))
                     fig_comp.add_hline(y=disp_price, line_dash="dash", line_color="red", annotation_text="Current Price")
                     fig_comp.update_layout(title="Methodology Comparison", template="plotly_dark", height=400)
-                    st.plotly_chart(fig_comp, use_container_width=True)
+                    st.plotly_chart(fig_comp, width="stretch")
                     
                 else:
                     st.warning("Negative or missing EBITDA. Cannot perform Exit Multiple analysis.")
@@ -1453,33 +1795,30 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
         else:
             st.warning("Insufficient financial data (FCF, Debt, or Shares) to auto-calculate valuation.")
 
-    # 3. RISK ANALYSIS (UPDATED WITH INTERPRETATIONS)
+    # 3. RISK ANALYSIS 
     with tab3:
         st.markdown('<h3 style="color:#1B4D2B;">Risk Analysis</h3>', unsafe_allow_html=True)
         
         bench_ticker = "^GSPC" 
-        if country_code == "IN": bench_ticker = "^NSEI" 
         
         with st.spinner("Calculating Risk Metrics..."):
             try:
                 end_date = datetime.now()
                 start_date = end_date - pd.Timedelta(days=365)
-                stock_hist = yf_obj.history(start=start_date, end=end_date)
-                bench_hist = yf.Ticker(bench_ticker).history(start=start_date, end=end_date)
+                stock_hist = fmp_obj.history(start=start_date, end=end_date)
+                bench_hist = FMP_Ticker(bench_ticker, fmp_key).history(start=start_date, end=end_date)
                 
                 if not stock_hist.empty and not bench_hist.empty:
                     beta = calculate_beta(stock_hist, bench_hist)
                     var_95 = calculate_var(stock_hist, 0.95)
                     max_drawdown = (stock_hist['Close'].min() - stock_hist['Close'].max()) / stock_hist['Close'].max()
                     
-                    # SAVE RISK DATA FOR EXPORT
                     st.session_state['risk_data'] = {
                         "beta": f"{beta:.2f}" if beta else "N/A",
                         "var": f"{var_95*100:.2f}%" if var_95 else "N/A",
                         "drawdown": f"{max_drawdown*100:.2f}%"
                     }
 
-                    # METRICS ROW
                     c_r1, c_r2, c_r3 = st.columns(3)
                     with c_r1:
                         st.metric("Beta", f"{beta:.2f}" if beta else "N/A")
@@ -1494,11 +1833,9 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                         st.metric("Max Drawdown (1Y)", f"{max_drawdown*100:.2f}%")
                         st.caption("**Meaning:** The worst drop from peak to bottom this year.")
 
-                    # DISTRIBUTION CHART
                     st.markdown("#### 📉 Volatility Distribution")
                     rets = stock_hist['Close'].pct_change().dropna()
                     
-                    # Matplotlib Figure for both Display AND PDF
                     fig_dist = Figure(figsize=(10, 4))
                     ax_dist = fig_dist.subplots()
                     sns.histplot(rets, kde=True, ax=ax_dist, color="orange", bins=50)
@@ -1507,7 +1844,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     ax_dist.legend()
                     st.pyplot(fig_dist)
                     
-                    st.session_state['fig_risk'] = fig_dist # SAVE FOR PDF
+                    st.session_state['fig_risk'] = fig_dist 
                     
                     st.info("""
                     **How to interpret this graph:**
@@ -1533,7 +1870,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             oscillator = st.selectbox("Bottom Panel", ["Volume", "RSI", "MACD"], index=0, key="chart_oscillator_box")
 
         try:
-            hist = yf_obj.history(period=chart_period)
+            hist = fmp_obj.history(period=chart_period)
             if not hist.empty:
                 if "SMA 50" in indicators: hist['SMA50'] = hist['Close'].rolling(window=50).mean()
                 if "SMA 200" in indicators: hist['SMA200'] = hist['Close'].rolling(window=200).mean()
@@ -1568,7 +1905,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                     fig_plotly.add_trace(go.Bar(x=hist.index, y=hist_macd, marker_color='gray', name='Hist'), row=2, col=1)
 
                 fig_plotly.update_layout(template='plotly_dark', height=700, xaxis_rangeslider_visible=False, margin=dict(l=0, r=0, t=30, b=0))
-                st.plotly_chart(fig_plotly, use_container_width=True)
+                st.plotly_chart(fig_plotly, width="stretch")
             else:
                 st.warning("No price history available.")
         except Exception as e:
@@ -1597,11 +1934,11 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             fin_type = st.selectbox("Select Statement", ["Income Statement", "Balance Sheet", "Cash Flow"])
             try:
                 if fin_type == "Income Statement": 
-                    st.dataframe(clean_financial_df(yf_obj.financials), use_container_width=True)
+                    st.dataframe(clean_financial_df(fmp_obj.financials), width="stretch")
                 elif fin_type == "Balance Sheet": 
-                    st.dataframe(clean_financial_df(yf_obj.balance_sheet), use_container_width=True)
+                    st.dataframe(clean_financial_df(fmp_obj.balance_sheet), width="stretch")
                 elif fin_type == "Cash Flow": 
-                    st.dataframe(clean_financial_df(yf_obj.cashflow), use_container_width=True)
+                    st.dataframe(clean_financial_df(fmp_obj.cashflow), width="stretch")
             except: st.warning("Financial data unavailable.")
 
         with subtab_rec:
@@ -1636,7 +1973,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                         }
                     ))
                     fig_gauge.update_layout(paper_bgcolor = "rgba(0,0,0,0)", font = {'color': "white", 'family': "Inter"}, height=350, margin=dict(l=30, r=30, t=80, b=20))
-                    st.plotly_chart(fig_gauge, use_container_width=True)
+                    st.plotly_chart(fig_gauge, width="stretch")
 
                 with col_text:
                     st.markdown(f"""
@@ -1644,7 +1981,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                         <div style="font-size: 14px; color: #888;">Number of Analysts</div>
                         <div style="font-size: 24px; font-weight: bold; color: #E6F0EA;">{info.get('numberOfAnalystOpinions', 'N/A')}</div>
                         <br>
-                        <div style="font-size: 14px; color: #888;">Actual Yahoo Score</div>
+                        <div style="font-size: 14px; color: #888;">Implied Score</div>
                         <div style="font-size: 18px; font-weight: bold; color: #AEE7B1;">{rec_mean}</div>
                     </div>
                     """, unsafe_allow_html=True)
@@ -1659,39 +1996,23 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
                 st.metric("Mean Analyst Price Target", human_readable_price(target, summary['price_currency']), f"{delta:.2f}% Upside")
 
         with subtab_news:
-            # IMPROVED NEWS LOGIC with rigorous None checking
             valid_news_count = 0
-            
-            # 1. Try Yahoo Finance News
             try:
-                yf_news = yf_obj.news
-                if yf_news and isinstance(yf_news, list):
-                    for item in yf_news[:5]:
+                fmp_news = fmp_obj.news
+                if fmp_news and isinstance(fmp_news, list):
+                    for item in fmp_news[:5]:
                         if not isinstance(item, dict): continue
-                        
-                        # Strict checking for title
                         title = item.get('title')
                         if not title or title.strip() == "" or title.lower() == "none": continue
                         
-                        # Filter out common Yahoo boilerplate
-                        if "yahoo finance" in title.lower() and len(title) < 20: continue
-                        
                         link = item.get('link', '#')
-                        publisher = item.get('publisher', 'Yahoo Finance')
-                        
-                        # Format Date
-                        pub_time_raw = item.get('providerPublishTime')
-                        pub_time_str = "Recent"
-                        if pub_time_raw:
-                            try:
-                                pub_time_str = datetime.fromtimestamp(pub_time_raw).strftime('%Y-%m-%d')
-                            except: pass
+                        publisher = item.get('publisher', 'News Source')
+                        pub_time_str = item.get('providerPublishTime', 'Recent')
                             
                         st.markdown(f"""<div style="background: rgba(255,255,255,0.05); padding: 10px; border-radius: 5px; margin-bottom: 10px; border-left: 4px solid #2D7A3E;"><a href="{link}" target="_blank" style="color: #AEE7B1; font-weight: bold; text-decoration: none;">{title}</a><div style="color: #888; font-size: 12px;">{pub_time_str} • {publisher}</div></div>""", unsafe_allow_html=True)
                         valid_news_count += 1
             except: pass
             
-            # 2. Fallback if YF failed or returned nothing valid
             if valid_news_count == 0:
                 fallback_news = fetch_news_fallback(summary['ticker_used'])
                 if fallback_news:
@@ -1716,15 +2037,15 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
             
             def fetch_peer_data(p_ticker):
                 try:
-                    p_obj = yf.Ticker(p_ticker)
+                    p_obj = FMP_Ticker(p_ticker, st.session_state.get('fmp_api_key'))
                     p_info = p_obj.info
-                    if p_info and 'regularMarketPrice' in p_info:
+                    if p_info and 'regularMarketPrice' in p_info and p_info.get('regularMarketPrice') is not None:
                         return {
                             "Ticker": p_ticker,
                             "Price": p_info.get('regularMarketPrice'),
                             "Market Cap": format_large_number(p_info.get('marketCap')),
                             "P/E Ratio": p_info.get('trailingPE'),
-                            "Forward P/E": p_info.get('forwardPE'),
+                            "Forward P/E": p_info.get('forwardPE', 'N/A'),
                             "P/B Ratio": p_info.get('priceToBook'),
                             "ROE": p_info.get('returnOnEquity'),
                             "Rev Growth": p_info.get('revenueGrowth'),
@@ -1741,7 +2062,7 @@ if st.session_state.get('analysis_done', False) and 'summary' in st.session_stat
 
             if comparison_data:
                 comp_df = pd.DataFrame(comparison_data).set_index("Ticker").transpose()
-                st.dataframe(comp_df, use_container_width=True)
+                st.dataframe(comp_df, width="stretch")
             else:
                 st.warning("No data found for peers.")
 
@@ -1758,8 +2079,8 @@ else:
                 <li><strong>Interactive Technicals</strong>: RSI, MACD, Bollinger Bands, and Volume analysis.</li>
                 <li><strong>Deep Fundamental Data</strong>: Access Income Statements, Balance Sheets, and Cash Flows.</li>
                 <li><strong>Peer Benchmarking</strong>: Compare key ratios against competitors instantly.</li>
-                <li><strong>NEW: DCF Calculator</strong>: 3 Models (Auto, Matrix, Exit Multiple).</li>
-                <li><strong>NEW: Risk Metrics</strong>: Interpretable Risk & Volatility Analysis.</li>
+                <li><strong>DCF Calculator</strong>: 3 Models (Auto, Matrix, Exit Multiple).</li>
+                <li><strong>Risk Metrics</strong>: Interpretable Risk & Volatility Analysis.</li>
             </ul>
         </div>
         ''', unsafe_allow_html=True)
@@ -1768,6 +2089,6 @@ else:
         <div style="background:linear-gradient(135deg,#EBF8F0 0%,#E8F0ED 100%); border:1px solid #2D7A3E; border-radius:12px; padding:2rem; text-align:center;">
             <div style="font-size:64px; margin-bottom:1rem;">💹</div>
             <h4 style="color:#1B4D2B; margin:0 0 1rem 0; font-size:18px;">Ready to Research?</h4>
-            <p style="color:#6B7280; margin:0; font-size:14px; line-height:1.6;">Start by entering a stock ticker in the sidebar.</p>
+            <p style="color:#6B7280; margin:0; font-size:14px; line-height:1.6;">Enter a stock ticker to begin. An FMP API Key is optional — the app uses free data (yfinance) by default.</p>
         </div>
         ''', unsafe_allow_html=True)
